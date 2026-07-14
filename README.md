@@ -1,9 +1,9 @@
 <h1 align="center">RL-100</h1>
 
-<h3 align="center">Performant Robotic Manipulation with Real-World Reinforcement Learning</h3>
+<h3 align="center">面向真实世界强化学习的高性能机器人操作框架</h3>
 
 <p align="center">
-  <b>A unified library for diffusion / flow policy RL post-training, iterative offline data flywheels, and real-world robot RL.</b>
+  <b>一个统一支持 diffusion / flow policy 强化学习后训练、迭代离线数据飞轮和真实机器人强化学习的代码库。</b>
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 
 ---
 
-<h4 align="center">Authors</h4>
+<h4 align="center">作者</h4>
 
 <p align="center">
   <a href="https://lei-kun.github.io/">Kun Lei</a><sup>*†</sup> ·
@@ -40,7 +40,7 @@
 </p>
 
 <p align="center"><b>
-  <sup>*</sup> Equal contribution &nbsp;·&nbsp; <sup>†</sup> Project Lead
+  <sup>*</sup> 共同一作 &nbsp;·&nbsp; <sup>†</sup> 项目负责人
 </b>
 </p>
 
@@ -48,104 +48,104 @@
 
 ---
 
-## Overview
+## 概览
 
-**RL-100** is a real-world reinforcement learning framework for robotic manipulation built on top of diffusion and flow visuomotor policies. It targets deployment-level **reliability**, **efficiency**, and **robustness** through a unified imitation-to-reinforcement learning pipeline.
+**RL-100** 是一个基于 diffusion 和 flow 视觉运动策略的真实世界机器人操作强化学习框架。它通过统一的 imitation-to-reinforcement learning 流水线，面向部署级别的**可靠性**、**效率**和**鲁棒性**。
 
-RL-100 aims to provide one of the most complete codebases for diffusion-policy RL and real-world robot RL post-training. The framework covers the following combinations in a unified repo.
+RL-100 旨在提供一个较完整的 diffusion policy RL 和真实机器人 RL 后训练代码库。该框架在一个统一仓库中覆盖以下组合。
 
-> **The supported options below are designed to be freely combined across axes for different robot post-training setups.**
+> **下方支持项可以跨轴自由组合，用于不同机器人后训练设置。**
 >
-> <span style="color:#dc2626"><strong>All combinations are implemented through a compact offline RL / online RL training interface.</strong></span>
+> <span style="color:#dc2626"><strong>所有组合都通过紧凑的 offline RL / online RL 训练接口实现。</strong></span>
 
 <table width="100%">
 <thead>
 <tr>
-  <th align="left">Axis</th>
-  <th align="left">Supported options</th>
+  <th align="left">维度</th>
+  <th align="left">支持选项</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-  <td><b>Policy backbone</b></td>
+  <td><b>策略骨干</b></td>
   <td>
     <span style="color:#16a34a">✓</span> Diffusion policy<br>
     <span style="color:#16a34a">✓</span> Flow policy
   </td>
 </tr>
 <tr>
-  <td><b>One-step deployment</b></td>
+  <td><b>一步部署</b></td>
   <td>
-    <span style="color:#2563eb">✓</span> Diffusion-to-CM one-step distillation<br>
-    <span style="color:#2563eb">✓</span> Flow-to-flow one-step on-policy distillation
+    <span style="color:#2563eb">✓</span> Diffusion-to-CM 一步蒸馏<br>
+    <span style="color:#2563eb">✓</span> Flow-to-flow 一步 on-policy 蒸馏
   </td>
 </tr>
 <tr>
-  <td><b>Observation modality</b></td>
+  <td><b>观测模态</b></td>
   <td>
-    <span style="color:#f59e0b">✓</span> 3D point cloud<br>
-    <span style="color:#f59e0b">✓</span> 2D RGB image
+    <span style="color:#f59e0b">✓</span> 3D 点云<br>
+    <span style="color:#f59e0b">✓</span> 2D RGB 图像
   </td>
 </tr>
 <tr>
-  <td><b>Control mode</b></td>
+  <td><b>控制模式</b></td>
   <td>
     <span style="color:#dc2626">✓</span> Action chunking<br>
-    <span style="color:#dc2626">✓</span> Single-action high-frequency control
+    <span style="color:#dc2626">✓</span> 单动作高频控制
   </td>
 </tr>
 <tr>
-  <td><b>Policy extraction strategy</b></td>
+  <td><b>策略提取策略</b></td>
   <td>
     <span style="color:#7c3aed">✓</span> Policy gradient<br>
-    <span style="color:#7c3aed">✓</span> IDQL-style extraction with reject sampling<br>
-    <span style="color:#7c3aed">✓</span> Hybrid variants
+    <span style="color:#7c3aed">✓</span> 带拒绝采样的 IDQL 风格提取<br>
+    <span style="color:#7c3aed">✓</span> 混合变体
   </td>
 </tr>
 <tr>
-  <td><b>RL stage</b></td>
+  <td><b>RL 阶段</b></td>
   <td>
     <span style="color:#0891b2">✓</span> Offline policy gradient<br>
     <span style="color:#0891b2">✓</span> Online policy gradient
   </td>
 </tr>
 <tr>
-  <td><b>Training data regime</b></td>
+  <td><b>训练数据机制</b></td>
   <td>
-    <span style="color:#db2777">✓</span> Teleoperation datasets<br>
-    <span style="color:#db2777">✓</span> Iterative offline rollout datasets<br>
+    <span style="color:#db2777">✓</span> 遥操作数据集<br>
+    <span style="color:#db2777">✓</span> 迭代离线 rollout 数据集<br>
     <span style="color:#db2777">✓</span> Online rollouts<br>
-    <span style="color:#db2777">✓</span> Offline-to-online mixed training
+    <span style="color:#db2777">✓</span> Offline-to-online 混合训练
   </td>
 </tr>
 </tbody>
 </table>
 
-> Starting from human teleoperation demonstrations, RL-100 iteratively refines policies with offline RL, deploys them to collect new real-robot rollouts, merges those rollouts back into the offline dataset, and optionally performs lightweight online RL fine-tuning.
+> 从人类遥操作 demonstration 出发，RL-100 会用 offline RL 迭代改进策略，把策略部署到真实机器人上采集新的 rollout，再把这些 rollout 合并回离线数据集，并可选进行轻量级 online RL 微调。
 
 ---
 
-## Table of Contents
+## 目录
 
-- [0. Quick Install Pointer](#0-quick-install-pointer)
-  - [Download the Smoke-Test Dataset](#download-the-smoke-test-dataset)
-- [1. Project Overview](#1-project-overview)
-- [2. RL Post-Training Framework](#2-rl-post-training-framework)
-- [3. Real-Robot Training and Data Flywheel](#3-real-robot-training-and-data-flywheel)
-- [Installation](#installation)
-- [Citation](#citation)
-- [Acknowledgements](#acknowledgements)
-- [License](#license)
+- [0. 快速安装指引](#0-快速安装指引)
+  - [下载 Smoke-Test 数据集](#下载-smoke-test-数据集)
+- [1. 项目概览](#1-项目概览)
+- [2. RL 后训练框架](#2-rl-后训练框架)
+- [3. 真实机器人训练和数据飞轮](#3-真实机器人训练和数据飞轮)
+- [安装](#安装)
+- [引用](#引用)
+- [致谢](#致谢)
+- [许可证](#许可证)
 
 ---
 
-## 0. Quick Install Pointer
+## 0. 快速安装指引
 
-For environment setup and dependency installation, see the [Installation](#installation) section and [`INSTALL.md`](INSTALL.md). We recommend using `adroit_door_medium` as the first smoke-test task.
+环境搭建和依赖安装请参见[安装](#安装)章节和 [`INSTALL.md`](INSTALL.md)。我们建议用 `adroit_door_medium` 作为第一个 smoke-test 任务。
 
-### Download the Smoke-Test Dataset
+### 下载 Smoke-Test 数据集
 
-The recommended `adroit_door_medium` zarr dataset is hosted on Hugging Face Datasets: [`leokk/RL-100-adroit-door-medium`](https://huggingface.co/datasets/leokk/RL-100-adroit-door-medium). From the repository root, download it with the Hugging Face CLI:
+推荐的 `adroit_door_medium` zarr 数据集托管在 Hugging Face Datasets：[`leokk/RL-100-adroit-door-medium`](https://huggingface.co/datasets/leokk/RL-100-adroit-door-medium)。在仓库根目录下，可以用 Hugging Face CLI 下载：
 
 ```bash
 python -m pip install -U huggingface_hub
@@ -157,7 +157,7 @@ hf download leokk/RL-100-adroit-door-medium \
 tar -xzf /tmp/adroit_door_medium.zarr.tar.gz -C RL-100/data
 ```
 
-If direct URL downloads are more convenient in your environment, use:
+如果你的环境更适合直接 URL 下载，可以使用：
 
 ```bash
 mkdir -p RL-100/data
@@ -166,74 +166,74 @@ wget -O /tmp/adroit_door_medium.zarr.tar.gz \
 tar -xzf /tmp/adroit_door_medium.zarr.tar.gz -C RL-100/data
 ```
 
-Optional checksum verification:
+可选的校验和验证：
 
 ```bash
 echo "73a7cd510a0715492e8f8041843ac51edf1a0feb6d30706a95a5e5857addef37  /tmp/adroit_door_medium.zarr.tar.gz" | sha256sum -c -
 ```
 
-After extraction, the dataset should be available at:
+解压后，数据集应位于：
 
 ```text
 Repo/RL-100/data/adroit_door_medium.zarr
 ```
 
-The dataset follows the RL-100 repository/data release terms. The formal dataset license will be finalized together with the public repository license.
+该数据集遵循 RL-100 仓库/数据发布条款。正式数据集许可证会和公开仓库许可证一起最终确定。
 
-## 1. Project Overview
+## 1. 项目概览
 
-### Why RL-100
+### 为什么是 RL-100
 
-RL-100 is designed as a **full-stack real-world robot learning system**, not only a collection of training scripts.
+RL-100 被设计为一个**全栈真实世界机器人学习系统**，而不只是一组训练脚本。
 
-It combines
+它在**一个代码库**中结合了：
 
-- **Behavior cloning**
-- **Offline policy-gradient RL**
-- **Iterative offline rollout data expansion**
-- **Online policy-gradient fine-tuning**
-- **One-step policy distillation**
+- **行为克隆**
+- **离线 policy-gradient RL**
+- **迭代离线 rollout 数据扩展**
+- **在线 policy-gradient 微调**
+- **一步策略蒸馏**
 
-in **one codebase**. The goal is to make real-world robot policy post-training a **repeatable pipeline** rather than a set of disconnected scripts.
+目标是把真实机器人策略后训练变成一个**可重复流水线**，而不是一组互不相连的脚本。
 
-### Repository Layout
+### 仓库结构
 
 ```text
 RL-100/
 ├── rl_100/
-│   ├── policy/              # 2D and 3D visuomotor policy implementations
-│   ├── unidpg/              # offline / online RL training logic
-│   └── config/              # policy, task, and training configs
+│   ├── policy/              # 2D 和 3D 视觉运动策略实现
+│   ├── unidpg/              # offline / online RL 训练逻辑
+│   └── config/              # policy、task 和训练配置
 ├── scripts/
-│   ├── Diffusion/           # diffusion policy training and online scripts
-│   └── Flow/                # flow policy training and online scripts
+│   ├── Diffusion/           # diffusion policy 训练和 online 脚本
+│   └── Flow/                # flow policy 训练和 online 脚本
 ├── tools/
-│   └── teleop_off2off_data/ # teleoperation and iterative offline data flywheel tools
-├── third_party/             # external environments and dependencies
-└── visualizer/              # lightweight point-cloud visualizer
+│   └── teleop_off2off_data/ # 遥操作和迭代离线数据飞轮工具
+├── third_party/             # 外部环境和依赖
+└── visualizer/              # 轻量级点云可视化器
 ```
 
 ---
 
-## 2. RL Post-Training Framework
+## 2. RL 后训练框架
 
-RL-100 turns the capability matrix above into a practical post-training pipeline for adapting large visuomotor policies from logged data and online interaction. This section focuses on the algorithmic stages and launchers; the real-robot iterative offline data flywheel is described in [Section 3](#3-real-robot-training-and-data-flywheel).
+RL-100 把上面的能力矩阵落实为一条实用的后训练流水线，用于从日志数据和 online 交互中适配大型视觉运动策略。本节关注算法阶段和启动器；真实机器人迭代离线数据飞轮见[第 3 节](#3-真实机器人训练和数据飞轮)。
 
-### Command Selector
+### 命令选择器
 
-Use the interactive selector to generate the launcher command from a few choices:
+可以使用交互式选择器，根据几个选项生成启动命令：
 
 ```bash
 python scripts/select_recipe.py
 ```
 
-It asks for:
+它会询问：
 
 <table width="100%">
 <thead>
 <tr>
   <th align="center" width="80">#</th>
-  <th align="left">Choice</th>
+  <th align="left">选项</th>
 </tr>
 </thead>
 <tbody>
@@ -242,14 +242,14 @@ It asks for:
 <tr><td align="center">3</td><td>3D &nbsp;/&nbsp; 2D</td></tr>
 <tr><td align="center">4</td><td>Chunk action &nbsp;/&nbsp; Single action</td></tr>
 <tr><td align="center">5</td><td>PG &nbsp;/&nbsp; PG + IDQL</td></tr>
-<tr><td align="center">6</td><td>One-step distill: Yes &nbsp;/&nbsp; No</td></tr>
+<tr><td align="center">6</td><td>一步蒸馏：是 &nbsp;/&nbsp; 否</td></tr>
 </tbody>
 </table>
 
-The first four choices select the launcher path. The PG/IDQL and distillation choices print launcher-level suggestions, because those settings are usually controlled inside the bash sweep. For example, the selector will remind you to use launcher flags for **PG** or **PG + IDQL-style extraction**; for offline distillation, first finish the offline sweep and parameter selection, then set `distill_phase='after_offline'`; for online distillation, set `distill_phase='online'`.
+前四个选项决定 launcher 路径。PG/IDQL 和蒸馏选项会打印 launcher 级别的建议，因为这些设置通常在 bash sweep 内控制。例如，选择器会提醒你使用 launcher flag 来启用 **PG** 或 **PG + IDQL 风格提取**；对于 offline distillation，应先完成 offline sweep 和参数选择，再设置 `distill_phase='after_offline'`；对于 online distillation，应设置 `distill_phase='online'`。
 
 <details>
-<summary><b>Example output</b></summary>
+<summary><b>示例输出</b></summary>
 
 ```text
 Command:
@@ -258,67 +258,67 @@ bash scripts/Flow/Online/3D/train_policy_online_flow_distill_online.sh rl100 adr
 
 </details>
 
-### Training Stages
+### 训练阶段
 
-The full algorithmic pipeline is organized around the following stages.
+完整算法流水线围绕以下阶段组织。
 
-#### Stage 1 · Behavior Cloning Initialization
+#### Stage 1 · 行为克隆初始化
 
-Train an initial visuomotor policy from demonstrations. This stage provides a stable policy prior before RL post-training.
+从 demonstrations 训练初始视觉运动策略。该阶段在 RL 后训练前提供稳定的 policy prior。
 
-#### Stage 2 · Offline RL Post-Training
+#### Stage 2 · Offline RL 后训练
 
-Improve the initialized policy with offline policy-gradient updates on logged trajectories. This stage supports diffusion and flow policies, 2D and 3D observation backbones, chunk-action and single-action control, and optional IDQL-style extraction configured through the launcher sweep.
+在日志轨迹上使用 offline policy-gradient 更新来改进初始化策略。该阶段支持 diffusion 和 flow policy、2D 和 3D 观测骨干、chunk-action 和 single-action 控制，以及通过 launcher sweep 配置的可选 IDQL 风格提取。
 
-**Example offline RL launchers:**
+**Offline RL 启动器示例：**
 
 ```bash
-# Single-GPU 3D diffusion offline RL.
+# 单卡 3D diffusion offline RL。
 bash scripts/Diffusion/Offline/3D/train_policy.sh rl100 adroit_door_medium 0112 100
 
-# DDP two-stage 3D diffusion offline RL.
-# The last argument is the number of GPUs.
+# DDP 两阶段 3D diffusion offline RL。
+# 最后一个参数是 GPU 数量。
 bash scripts/Diffusion/Offline/3D/train_policy_two_stage.sh rl100 adroit_door_medium 0112 100 4
 ```
 
-The 2D and chunk-action offline recipes also provide DDP-style launchers, including:
+2D 和 chunk-action offline recipe 也提供 DDP 风格启动器，包括：
 
 - `scripts/Diffusion/Offline/2D/train_policy_image_unet_two_stage.sh`
 - `scripts/Diffusion/Offline/2D/train_policy_image_unet_chunk_two_stage.sh`
 - `scripts/Diffusion/Offline/3D/train_policy_chunk_two_stage.sh`
 
-#### Stage 3 · Online RL Fine-Tuning
+#### Stage 3 · Online RL 微调
 
-Continue improving the policy using real or simulated online rollouts. The current rollout policy collects transitions, and PPO-style updates reuse the existing rollout and log-probability flow.
+使用真实或仿真的 online rollouts 继续改进策略。当前 rollout policy 收集 transitions，PPO 风格更新复用已有 rollout 和 log-probability 流程。
 
-This stage supports:
+该阶段支持：
 
-- Online policy gradient.
-- Diffusion and flow online fine-tuning.
-- 2D and 3D online runners.
-- Chunked and high-frequency single-action control.
-- Lightweight online adaptation after offline RL.
+- Online policy gradient。
+- Diffusion 和 flow online 微调。
+- 2D 和 3D online runners。
+- Chunked 和高频 single-action 控制。
+- Offline RL 之后的轻量 online adaptation。
 
-#### Stage 4 · One-Step Policy Distillation
+#### Stage 4 · 一步策略蒸馏
 
-For deployment efficiency, RL-100 includes one-step policy extraction and distillation paths:
+为了提升部署效率，RL-100 包含一步策略提取和蒸馏路径：
 
-- **Diffusion-to-CM** — distill a multi-step diffusion policy into a consistency-model style one-step policy.
-- **Flow-to-flow** — distill or extract a one-step flow policy through on-policy training.
+- **Diffusion-to-CM**：把多步 diffusion policy 蒸馏成 consistency-model 风格的一步策略。
+- **Flow-to-flow**：通过 on-policy training 蒸馏或提取一步 flow policy。
 
-These paths are intended for fast real-robot inference while retaining the behavior improved by RL post-training.
+这些路径面向快速真实机器人推理，同时保留 RL 后训练带来的行为改进。
 
-#### Stage 5 · Policy Extraction
+#### Stage 5 · 策略提取
 
-RL-100 supports policy extraction strategies used in robot policy post-training:
+RL-100 支持机器人策略后训练中使用的策略提取方式：
 
-- Policy-gradient extraction from logged or online transitions.
-- IDQL-style extraction with reject sampling from higher-quality sampled trajectories.
-- Hybrid strategies that combine policy-gradient updates with filtered or selected data.
+- 从日志或 online transitions 中进行 policy-gradient 提取。
+- 使用来自高质量采样轨迹的拒绝采样进行 IDQL 风格提取。
+- 结合 policy-gradient 更新和过滤/选择数据的混合策略。
 
-### Configuration Entry Points
+### 配置入口
 
-The main implementation and configuration entry points are:
+主要实现和配置入口是：
 
 ```text
 RL-100/rl_100/policy/rl100_3d.py
@@ -329,29 +329,29 @@ scripts/Diffusion/
 scripts/Flow/
 ```
 
-Detailed command lines and recommended configs are organized around these entry points and will be expanded as the release scripts are finalized.
+详细命令行和推荐配置围绕这些入口组织，并会随着 release 脚本最终确定继续扩展。
 
 ---
 
-## 3. Real-Robot Training and Data Flywheel
+## 3. 真实机器人训练和数据飞轮
 
-RL-100 includes a real-robot data flywheel for iterative offline reinforcement learning and final online improvement.
+RL-100 包含一个真实机器人数据飞轮，用于迭代离线强化学习和最终 online improvement。
 
 <table width="100%">
 <thead>
 <tr>
-  <th align="left">Stage</th>
-  <th align="left">Input</th>
-  <th align="left">Output</th>
+  <th align="left">阶段</th>
+  <th align="left">输入</th>
+  <th align="left">输出</th>
 </tr>
 </thead>
 <tbody>
-<tr><td><b>Teleoperation</b></td><td>Human demonstrations</td><td>Raw robot episodes</td></tr>
-<tr><td><b>Data preparation</b></td><td>Raw teleop data and rollout data</td><td>Training zarr dataset</td></tr>
-<tr><td><b>Offline RL</b></td><td>Merged offline dataset</td><td>Improved policy checkpoint</td></tr>
-<tr><td><b>Real-robot rollout</b></td><td>Offline RL checkpoint</td><td>New policy rollout dataset</td></tr>
-<tr><td><b>Iterative offline dataset merge</b></td><td>Base zarr and new rollout h5 files</td><td>Next-round zarr dataset</td></tr>
-<tr><td><b>Online RL</b></td><td>Offline RL checkpoint and live rollouts</td><td>Final deployment checkpoint</td></tr>
+<tr><td><b>遥操作</b></td><td>人类 demonstrations</td><td>原始机器人 episodes</td></tr>
+<tr><td><b>数据准备</b></td><td>原始 teleop 数据和 rollout 数据</td><td>训练 zarr 数据集</td></tr>
+<tr><td><b>Offline RL</b></td><td>合并后的离线数据集</td><td>改进后的 policy checkpoint</td></tr>
+<tr><td><b>真实机器人 rollout</b></td><td>Offline RL checkpoint</td><td>新的 policy rollout 数据集</td></tr>
+<tr><td><b>迭代离线数据集合并</b></td><td>Base zarr 和新的 rollout h5 文件</td><td>下一轮 zarr 数据集</td></tr>
+<tr><td><b>Online RL</b></td><td>Offline RL checkpoint 和 live rollouts</td><td>最终部署 checkpoint</td></tr>
 </tbody>
 </table>
 
@@ -367,70 +367,70 @@ human teleoperation
                                       └─▶ online RL fine-tuning
 ```
 
-### Real-Robot Setup
+### 真实机器人设置
 
-This section tracks the hardware and runtime assumptions needed for real-robot deployment:
+本节记录真实机器人部署所需的硬件和运行时假设：
 
-- Robot platform and controller requirements.
-- Camera and point-cloud setup.
-- End-effector / hand / gripper setup.
-- Workspace limits and reset protocol.
-- Safety checks before running learned policies.
+- 机器人平台和控制器要求。
+- 相机和点云设置。
+- 末端执行器 / 灵巧手 / 夹爪设置。
+- 工作空间限制和 reset protocol。
+- 运行学习策略前的安全检查。
 
-### Teleoperation Data Collection
+### 遥操作数据采集
 
-Teleoperation and data processing utilities live in:
+遥操作和数据处理工具位于：
 
 ```text
 tools/teleop_off2off_data/
 ```
 
-The planned workflow is:
+计划工作流为：
 
 ```bash
 cd tools/teleop_off2off_data
 
-# Collect teleoperation data
+# 采集遥操作数据
 python teleop.py
 
-# Or use the swapped teleoperation entry if required by the robot setup
+# 如果机器人设置需要，也可以使用 swapped teleoperation 入口
 python teleop_swapped.py
 ```
 
-> Hardware-specific command-line arguments should be documented next to the corresponding robot setup.
+> 硬件相关命令行参数应记录在对应机器人设置旁边。
 
-### Data Preparation
+### 数据准备
 
-The data preparation entry point is:
+数据准备入口为：
 
 ```bash
 cd tools/teleop_off2off_data
 python data_prepare.py --config configs/data_prepare.yaml
 ```
 
-For the full teleoperation and iterative offline dataset workflow, see [`tools/teleop_off2off_data/DATA_PREPARE.md`](tools/teleop_off2off_data/DATA_PREPARE.md).
+完整遥操作和迭代离线数据集工作流见 [`tools/teleop_off2off_data/DATA_PREPARE.md`](tools/teleop_off2off_data/DATA_PREPARE.md)。
 
-The tool supports three modes:
+该工具支持三种模式：
 
 <table width="100%">
 <thead>
 <tr>
-  <th align="left">Mode</th>
-  <th align="left">Purpose</th>
+  <th align="left">模式</th>
+  <th align="left">用途</th>
 </tr>
 </thead>
 <tbody>
-<tr><td><code>raw_to_npy</code></td><td>Convert raw teleoperation episodes into processed <code>.npy</code> data.</td></tr>
-<tr><td><code>build_zarr</code></td><td>Build a new training zarr from processed teleop data and selected rollout sources.</td></tr>
-<tr><td><code>extend_zarr</code></td><td>Append new rollout sources to a base zarr and write a new zarr without modifying the base dataset in place.</td></tr>
+<tr><td><code>raw_to_npy</code></td><td>把原始遥操作 episodes 转成处理后的 <code>.npy</code> 数据。</td></tr>
+<tr><td><code>build_zarr</code></td><td>从处理后的 teleop 数据和选定 rollout sources 构建新的训练 zarr。</td></tr>
+<tr><td><code>extend_zarr</code></td><td>向 base zarr 追加新的 rollout sources，并写出一个新的 zarr，不原地修改 base 数据集。</td></tr>
 </tbody>
 </table>
 
-### Iterative Offline RL Data Flywheel
+### 迭代 Offline RL 数据飞轮
 
-Iterative offline training is the main data flywheel used by the real-robot pipeline. A policy trained by offline RL is rolled out on the robot, the resulting trajectories are stored as rollout datasets, and the next offline RL round trains on the merged dataset.
+迭代离线训练是真实机器人流水线使用的主要数据飞轮。由 offline RL 训练出的策略会在机器人上 rollout，生成的轨迹会作为 rollout 数据集保存，下一轮 offline RL 则在合并后的数据集上训练。
 
-Policy rollouts collected on the real robot are treated as named data sources in YAML:
+真实机器人上采集的 policy rollouts 在 YAML 中作为命名数据源：
 
 ```yaml
 rollout_sources:
@@ -441,13 +441,13 @@ rollout_sources:
     path: /path/to/policy_rollouts/004/online_ft
 ```
 
-**Typical usage:**
+**典型用法：**
 
 ```bash
-# Build a dataset from teleop data plus all enabled rollout sources.
+# 从 teleop 数据和所有启用的 rollout sources 构建数据集。
 python data_prepare.py --config configs/data_prepare.yaml --mode build_zarr --include-rollouts
 
-# Extend an existing zarr with one new rollout source.
+# 用一个新的 rollout source 扩展已有 zarr。
 python data_prepare.py \
   --config configs/data_prepare.yaml \
   --mode extend_zarr \
@@ -456,7 +456,7 @@ python data_prepare.py \
   --zarr-output-path /path/to/new.zarr
 ```
 
-The merge output preserves the training schema expected by RL-100:
+合并输出会保持 RL-100 训练代码期望的 schema：
 
 ```text
 data/
@@ -468,31 +468,31 @@ meta/
 └── episode_ends
 ```
 
-### Train on the Real-Robot Dataset
+### 在真实机器人数据集上训练
 
-After generating a zarr dataset, point the RL-100 task config to the dataset path and run the selected offline RL script.
+生成 zarr 数据集后，将 RL-100 task config 指向该数据集路径，然后运行所选 offline RL 脚本。
 
-This section is reserved for the concrete real-robot training recipes:
+本节预留给具体真实机器人训练 recipe：
 
-- Real-robot task config examples.
-- 3D point-cloud offline training commands.
-- 2D image offline training commands.
-- Recommended checkpoint selection and evaluation workflow.
+- 真实机器人 task config 示例。
+- 3D 点云 offline 训练命令。
+- 2D 图像 offline 训练命令。
+- 推荐 checkpoint 选择和评估流程。
 
-### Real-Robot Rollout Collection
+### 真实机器人 Rollout 采集
 
-Iterative offline rollout collection reuses the online training launcher as a real-robot data collection wrapper. In practice, load the offline-RL-finetuned policy checkpoint, enter the online script, and use the evaluation call before or during online fine-tuning to roll out the policy on the robot and save `.h5` trajectories.
+迭代离线 rollout 采集会复用 online training launcher 作为真实机器人数据采集 wrapper。实践中，加载 offline-RL 微调后的 policy checkpoint，进入 online 脚本，并在 online 微调前或过程中调用 evaluation 来让策略在机器人上 rollout，同时保存 `.h5` 轨迹。
 
-The real-robot offline and online training bash scripts are the same launchers introduced in [Section 2](#2-rl-post-training-framework). The only extra setting for iterative offline rollout collection is enabling `data_collect=True` in the collection run.
+真实机器人 offline 和 online 训练 bash 脚本与[第 2 节](#2-rl-后训练框架)介绍的 launcher 相同。迭代离线 rollout 采集唯一额外设置是，在采集运行中启用 `data_collect=True`。
 
-The offline and online launchers must describe the same policy network so that checkpoint weights load cleanly. Keep architecture-related options consistent between the offline training bash and the rollout-collection bash, including the policy family, observation modality, chunk/single-action setting, `policy.model`, `policy.encoder_type`, `policy.use_vib`, `policy.use_recon`, `horizon`, `n_action_steps`, `n_obs_steps`, encoder output size, and diffusion/flow scheduler settings. If the online bash changes these fields, the offline checkpoint may partially fail to load or silently run with a mismatched policy.
+Offline 和 online launchers 必须描述同一个 policy network，checkpoint 权重才能正确加载。需要保持 offline 训练 bash 和 rollout-collection bash 中的架构相关选项一致，包括 policy family、观测模态、chunk/single-action 设置、`policy.model`、`policy.encoder_type`、`policy.use_vib`、`policy.use_recon`、`horizon`、`n_action_steps`、`n_obs_steps`、encoder 输出维度，以及 diffusion/flow scheduler 设置。如果 online bash 修改这些字段，offline checkpoint 可能只会部分加载，或者在静默的网络不匹配状态下运行。
 
-For RL data collection, the rollout policy should be stochastic rather than a deterministic evaluation policy. Set `data_collect=True` in the bash/config path used for collection. This enables two noise sources:
+对于 RL 数据采集，rollout policy 应该是随机的，而不是确定性的 evaluation policy。在用于采集的 bash/config 路径中设置 `data_collect=True`。这会启用两个噪声来源：
 
-- 🔴 **Denoising/SDE action noise:** the real-robot runner switches `deterministic=False` when `data_collect=True`, so `policy.predict_action(...)` samples stochastic denoising transitions.
-- 🔴 **VIB latent noise:** with `policy.use_vib=True` and `ppo.force_stochastic_online=True`, `train_real.py` keeps the observation encoder stochastic during `eval(..., data_collect=True)`.
+- **Denoising/SDE action noise：** 当 `data_collect=True` 时，真实机器人 runner 会切换到 `deterministic=False`，因此 `policy.predict_action(...)` 会采样随机 denoising transitions。
+- **VIB latent noise：** 当 `policy.use_vib=True` 且 `ppo.force_stochastic_online=True` 时，`train_real.py` 会在 `eval(..., data_collect=True)` 中保持 observation encoder 随机。
 
-Typical real-robot collection settings:
+典型真实机器人采集设置：
 
 ```bash
 data_collect=True
@@ -500,41 +500,41 @@ policy.use_vib=True
 ppo.force_stochastic_online=True
 ```
 
-Use `offline_cp_timestamp` / `offline_cp_timestep` or the corresponding checkpoint-loading fields in the online launcher to point to the selected offline RL checkpoint. The generated rollout `.h5` files should then be added as a new `rollout_sources` entry in `tools/teleop_off2off_data/configs/data_prepare.yaml`.
+使用 `offline_cp_timestamp` / `offline_cp_timestep` 或 online launcher 中对应的 checkpoint-loading 字段，指向所选 offline RL checkpoint。生成的 rollout `.h5` 文件随后应添加为 `tools/teleop_off2off_data/configs/data_prepare.yaml` 中的新 `rollout_sources` 条目。
 
-### Online Real-Robot Fine-Tuning
+### Online 真实机器人微调
 
-This section covers the final online RL stage:
+本节覆盖最终 online RL 阶段：
 
-- Set `data_collect=False` before starting actual online RL fine-tuning. `data_collect=True` is only for iterative offline rollout dataset collection; leaving it enabled during online fine-tuning will make periodic eval calls run in collection mode and write rollout `.h5` files.
-- Start from a BC or offline RL checkpoint.
-- Collect short online rollouts on the real robot.
-- Run online policy-gradient updates.
-- Evaluate and save deployment checkpoints.
+- 启动真实 online RL 微调前设置 `data_collect=False`。`data_collect=True` 只用于迭代离线 rollout 数据集采集；如果 online 微调时忘记关闭，周期性 eval 会以采集模式运行并写出 rollout `.h5` 文件。
+- 从 BC 或 offline RL checkpoint 开始。
+- 在真实机器人上采集短 online rollouts。
+- 执行 online policy-gradient 更新。
+- 评估并保存部署 checkpoint。
 
-### Safety Notes
+### 安全注意事项
 
-> ⚠ Before running policies on hardware:
+> 在硬件上运行策略前：
 
-- Verify workspace bounds and action scaling.
-- Test controller latency and emergency stop.
-- Start with low speed and conservative action limits.
-- Run short supervised rollouts before autonomous long runs.
-- **Do not** deploy a checkpoint on hardware before validating observation normalization, action dimensions, and reset behavior.
+- 验证工作空间边界和 action scaling。
+- 测试控制器延迟和急停。
+- 从低速和保守 action 限制开始。
+- 在自主长时间运行前，先进行短时有人监督 rollout。
+- **不要**在验证 observation normalization、action 维度和 reset 行为前，把 checkpoint 部署到硬件上。
 
 ---
 
-## Installation
+## 安装
 
-See [`INSTALL.md`](INSTALL.md) for the full environment setup. We recommend using `adroit_door_medium` as the first smoke-test task.
+完整环境配置见 [`INSTALL.md`](INSTALL.md)。我们建议使用 `adroit_door_medium` 作为第一个 smoke-test 任务。
 
-**The verified server setup uses:**
+**已验证服务器设置使用：**
 
 <table width="100%">
 <thead>
 <tr>
-  <th align="left">Component</th>
-  <th align="left">Version</th>
+  <th align="left">组件</th>
+  <th align="left">版本</th>
 </tr>
 </thead>
 <tbody>
@@ -545,7 +545,7 @@ See [`INSTALL.md`](INSTALL.md) for the full environment setup. We recommend usin
 </tbody>
 </table>
 
-**Minimal workflow:**
+**最小工作流：**
 
 ```bash
 conda create -n rl100 --clone dp3 -y
@@ -567,14 +567,14 @@ python -m pip install -e third_party/pytorch3d_simplified
 python -m pip install -e visualizer
 ```
 
-**Sanity check:**
+**Sanity check：**
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 python -c "import rl_100, zarr, hydra, einops, metaworld, mujoco_py, open3d as o3d; print('imports ok', o3d.__version__)"
 ```
 
-**Verified flow online distillation entry:**
+**已验证的 flow online distillation 入口：**
 
 ```bash
 ./scripts/Flow/Online/3D/train_policy_online_flow_distill_online.sh rl100 adroit_door_medium 0112 100 8
@@ -582,9 +582,9 @@ python -c "import rl_100, zarr, hydra, einops, metaworld, mujoco_py, open3d as o
 
 ---
 
-## Citation
+## 引用
 
-If you find this work useful, please cite:
+如果你觉得这个工作有用，请引用：
 
 ```bibtex
 @article{rl100,
@@ -596,7 +596,7 @@ If you find this work useful, please cite:
 ```
 
 <details>
-<summary><b>Also consider citing the related RL post-training methods used by this project</b></summary>
+<summary><b>也请考虑引用本项目使用的相关 RL 后训练方法</b></summary>
 
 ```bibtex
 @inproceedings{lei2024unio,
@@ -620,16 +620,16 @@ If you find this work useful, please cite:
 
 ---
 
-## Acknowledgements
+## 致谢
 
-RL-100 builds on prior work in **Uni-O4**, **BPPO**, **DP3**, **Diffusion Policy**, robotic manipulation environments, and reinforcement learning infrastructure. Detailed third-party acknowledgements and license notes will be maintained with the corresponding code and dependencies.
+RL-100 建立在 **Uni-O4**、**BPPO**、**DP3**、**Diffusion Policy**、机器人操作环境和强化学习基础设施等前序工作的基础上。详细的第三方致谢和许可证说明会随对应代码和依赖维护。
 
 ---
 
-## License
+## 许可证
 
-This project is released under the [Apache License 2.0](LICENSE).
+本项目基于 [Apache License 2.0](LICENSE) 发布。
 
 <div align="center">
-<sub>Made with care by the RL-100 team.</sub>
+<sub>由 RL-100 团队用心制作。</sub>
 </div>

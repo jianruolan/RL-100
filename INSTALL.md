@@ -1,8 +1,8 @@
-# RL-100 Installation
+# RL-100 安装指南
 
-This guide installs the environment used by RL-100 for simulation training, iterative offline RL, online RL, and flow/diffusion policy distillation.
+本指南用于安装 RL-100 在仿真训练、迭代 offline RL、online RL 以及 flow/diffusion policy distillation 中使用的环境。
 
-The setup below was verified on the current server with:
+下方设置已在当前服务器上验证：
 
 ```text
 NVIDIA driver: 550.54.15
@@ -12,22 +12,22 @@ PyTorch: 2.4.0+cu121
 torch.version.cuda: 12.1
 ```
 
-The driver supports CUDA 12.4, while the verified PyTorch wheel is the CUDA 12.1 build. This is expected: CUDA 12.1 PyTorch wheels run correctly on the CUDA 12.4 driver.
+驱动支持 CUDA 12.4，而已验证的 PyTorch wheel 是 CUDA 12.1 构建。这是正常情况：CUDA 12.1 的 PyTorch wheel 可以在 CUDA 12.4 驱动上正确运行。
 
-## 1. Create the Environment
+## 1. 创建环境
 
-### Recommended on this server
+### 当前服务器推荐方式
 
-The existing `dp3` environment is known to run this repo. The verified `rl100` environment was created by cloning it, then reinstalling editable packages to this repo path:
+已有的 `dp3` 环境已知可以运行本仓库。已验证的 `rl100` 环境是通过克隆该环境，并把 editable packages 重新安装到当前仓库路径来创建的：
 
 ```bash
 conda create -n rl100 --clone dp3 -y
 conda activate rl100
 ```
 
-### From scratch
+### 从零安装
 
-For a clean machine, start with Python 3.8 and the verified PyTorch version:
+在一台干净机器上，先使用 Python 3.8 和已验证的 PyTorch 版本：
 
 ```bash
 conda create -n rl100 python=3.8 -y
@@ -37,7 +37,7 @@ python -m pip install "setuptools==59.5.0" wheel
 python -m pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Then install the Python package set used by RL-100:
+然后安装 RL-100 使用的 Python 包集合：
 
 ```bash
 python -m pip install \
@@ -54,7 +54,7 @@ python -m pip install \
   timm==1.0.26 transformers==4.40.0
 ```
 
-Real-robot and camera tools are optional for simulation-only runs:
+如果只跑仿真，真实机器人和相机工具是可选的：
 
 ```bash
 python -m pip install \
@@ -64,7 +64,7 @@ python -m pip install \
   "timm>=0.9.0" "torchvision>=0.15.0" "einops>=0.6.0"
 ```
 
-The optional package set is:
+可选包集合为：
 
 ```text
 ur_rtde==1.6.1
@@ -86,18 +86,18 @@ wrapt==1.17.2
 diffusers==0.33.1
 ```
 
-Some real-robot packages, such as `pyrealsense2`, `ur_rtde`, and hardware wrappers, may require matching hardware/OS support. If you only run simulated Adroit/DexArt/MetaWorld training, install failures from unavailable hardware packages can be handled separately.
+部分真实机器人包，例如 `pyrealsense2`、`ur_rtde` 和硬件 wrapper，可能要求匹配的硬件/操作系统支持。如果你只运行模拟的 Adroit/DexArt/MetaWorld 训练，无法安装的硬件包可以单独处理。
 
-## 2. Set Runtime Paths
+## 2. 设置运行时路径
 
-`RL-100/` is not a pip-installable Python package in this repo because it has no `setup.py` or `pyproject.toml`. Use `PYTHONPATH`:
+本仓库中的 `RL-100/` 不是一个可通过 pip 安装的 Python 包，因为它没有 `setup.py` 或 `pyproject.toml`。请使用 `PYTHONPATH`：
 
 ```bash
 export REPO_ROOT=/path/to/RL-100-repo
 export PYTHONPATH=${REPO_ROOT}/RL-100:${PYTHONPATH}
 ```
 
-For MuJoCo/EGL rendering:
+对于 MuJoCo/EGL 渲染：
 
 ```bash
 export LD_LIBRARY_PATH=${HOME}/.mujoco/mujoco210/bin:/usr/lib/nvidia:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
@@ -105,11 +105,11 @@ export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 ```
 
-The online scripts set `CUDA_VISIBLE_DEVICES`, `MUJOCO_EGL_DEVICE_ID`, and `EGL_DEVICE_ID` based on the selected GPU.
+Online 脚本会基于选中的 GPU 设置 `CUDA_VISIBLE_DEVICES`、`MUJOCO_EGL_DEVICE_ID` 和 `EGL_DEVICE_ID`。
 
-## 3. Install MuJoCo
+## 3. 安装 MuJoCo
 
-Install MuJoCo 2.1 under `~/.mujoco`:
+将 MuJoCo 2.1 安装到 `~/.mujoco`：
 
 ```bash
 mkdir -p ~/.mujoco
@@ -118,16 +118,16 @@ wget https://github.com/deepmind/mujoco/releases/download/2.1.0/mujoco210-linux-
 tar -xvzf mujoco210.tar.gz
 ```
 
-On a clean Ubuntu machine, `mujoco-py` EGL builds usually also need:
+在干净的 Ubuntu 机器上，`mujoco-py` 的 EGL 构建通常还需要：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y libglew-dev libgl1-mesa-dev libosmesa6-dev libglfw3 libglfw3-dev patchelf ninja-build
 ```
 
-## 4. Install Editable Repo Dependencies
+## 4. 安装仓库内 editable 依赖
 
-From the repo root:
+从仓库根目录运行：
 
 ```bash
 conda activate rl100
@@ -142,31 +142,31 @@ python -m pip install -e third_party/pytorch3d_simplified
 python -m pip install -e visualizer
 ```
 
-Important notes:
+重要说明：
 
-- Do **not** run `pip install -e RL-100`; `RL-100/` is imported through `PYTHONPATH`.
-- The current `third_party/r3m` directory does not contain an installable package. The verified server environment currently imports `r3m` from an external editable install. For a clean release, either populate `third_party/r3m` with the R3M source or install an equivalent `r3m` package before running image/R3M encoder code paths.
-- `gym` should resolve to this repo's `third_party/gym-0.21.0`.
+- **不要**运行 `pip install -e RL-100`；`RL-100/` 通过 `PYTHONPATH` 导入。
+- 当前 `third_party/r3m` 目录不包含可安装包。已验证服务器环境目前从外部 editable install 导入 `r3m`。对于干净 release，要么把 R3M 源码放入 `third_party/r3m`，要么在运行 image/R3M encoder 代码路径前安装等价的 `r3m` 包。
+- `gym` 应解析到本仓库的 `third_party/gym-0.21.0`。
 
-Check editable locations:
+检查 editable 位置：
 
 ```bash
 python -m pip show dexart gym metaworld mj-envs mjrl mujoco-py pytorch3d visualizer r3m
 ```
 
-Editable project locations should point to this repo, except `r3m` if it is intentionally installed from an external source.
+Editable project locations 应指向当前仓库，除非你有意从外部安装 `r3m`。
 
-## 5. Assets and Data
+## 5. Assets 和数据
 
-Before training, make sure these paths exist when the selected task needs them:
+训练前，请确认所选任务需要的路径存在：
 
 ```text
 third_party/dexart-release/assets       # DexArt assets
-third_party/VRL3/ckpts                  # Adroit expert checkpoints, if generating demos
+third_party/VRL3/ckpts                  # 如果生成 demos，需要 Adroit expert checkpoints
 RL-100/data/*.zarr                      # offline datasets
 ```
 
-For Adroit medium tasks such as `adroit_door_medium`, the dataset path is configured in:
+对于 `adroit_door_medium` 等 Adroit medium 任务，数据集路径配置在：
 
 ```text
 RL-100/rl_100/config/task/adroit_door_medium.yaml
@@ -174,7 +174,7 @@ RL-100/rl_100/config/task/adroit_door_medium.yaml
 
 ## 6. Sanity Checks
 
-Run these from the repo root:
+从仓库根目录运行：
 
 ```bash
 conda activate rl100
@@ -189,7 +189,7 @@ python -c "import rl_100, zarr, hydra, einops, metaworld, mujoco_py, open3d as o
 python -c "import gym; print('gym version:', gym.__version__)"
 ```
 
-Expected:
+预期输出：
 
 ```text
 torch 2.4.0+cu121, torch.version.cuda 12.1, cuda available True
@@ -197,15 +197,15 @@ imports ok 0.19.0
 gym version: 0.21.0
 ```
 
-## 7. Verified Flow Online Distillation Run
+## 7. 已验证的 Flow Online Distillation 运行
 
-The flow online distillation launcher is:
+Flow online distillation launcher 是：
 
 ```text
 scripts/Flow/Online/3D/train_policy_online_flow_distill_online.sh
 ```
 
-Use this standard example command in the `rl100` environment:
+在 `rl100` 环境中使用这个标准示例命令：
 
 ```bash
 conda activate rl100
@@ -218,7 +218,7 @@ export PYOPENGL_PLATFORM=egl
 ./scripts/Flow/Online/3D/train_policy_online_flow_distill_online.sh rl100 adroit_door_medium 0112 100 8
 ```
 
-This expands to `train.py --config-name=rl100_3d_flow.yaml` with:
+它会展开为带有以下关键覆盖项的 `train.py --config-name=rl100_3d_flow.yaml`：
 
 ```text
 task=adroit_door_medium
@@ -231,39 +231,39 @@ flow_distill_inference_steps=1
 flow_distill_teacher_steps=10
 ```
 
-PG / PG + IDQL-style extraction and one-step distillation are launcher-level sweep settings. For offline distillation, finish the offline sweep first and then set `distill_phase='after_offline'`; for online distillation, set `distill_phase='online'`.
+PG / PG + IDQL 风格提取和一步蒸馏是 launcher 级别的 sweep 设置。对于 offline distillation，先完成 offline sweep，再设置 `distill_phase='after_offline'`；对于 online distillation，设置 `distill_phase='online'`。
 
-This launcher path was validated in the `rl100` environment: it reached the `python train.py` training process and initialized MuJoCo/EGL successfully. Since it is a long online training job (`ppo.max_train_steps=1000000`, `training.num_epochs=200`), the validation run was stopped after confirming the training entry process was active.
+该 launcher 路径已在 `rl100` 环境中验证：它可以进入 `python train.py` 训练进程，并成功初始化 MuJoCo/EGL。由于它是较长的 online 训练任务（`ppo.max_train_steps=1000000`，`training.num_epochs=200`），验证运行在确认训练入口进程已启动后停止。
 
-## 8. Common Issues
+## 8. 常见问题
 
-### Mixed editable installs
+### 混合 editable installs
 
-If you have several copies of this repo on the same machine, stale editable installs can silently import code from the wrong path.
+如果同一台机器上有多个本仓库副本，过期的 editable installs 可能会静默地从错误路径导入代码。
 
-Use:
+使用：
 
 ```bash
 python -m pip show dexart gym metaworld mj-envs mjrl mujoco-py pytorch3d visualizer r3m
 ```
 
-and reinstall editable packages from the current repo if needed.
+如有需要，从当前仓库重新安装 editable packages。
 
 ### `ModuleNotFoundError: rl_100`
 
-Set:
+设置：
 
 ```bash
 export PYTHONPATH=$(pwd)/RL-100:${PYTHONPATH}
 ```
 
-### `r3m` import issues
+### `r3m` 导入问题
 
-The current repo does not include an installable `third_party/r3m` package. Install or populate R3M before using R3M-based image encoders.
+当前仓库不包含可安装的 `third_party/r3m` 包。使用基于 R3M 的图像 encoder 前，请先安装或补全 R3M。
 
-### MuJoCo/OpenGL errors
+### MuJoCo/OpenGL 错误
 
-Check:
+检查：
 
 ```bash
 export LD_LIBRARY_PATH=${HOME}/.mujoco/mujoco210/bin:/usr/lib/nvidia:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
