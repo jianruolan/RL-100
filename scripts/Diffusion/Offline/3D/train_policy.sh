@@ -37,6 +37,8 @@ cd RL-100
 
 
 export MUJOCO_GL=egl
+export MUJOCO_PY_MUJOCO_PATH="${MUJOCO_PY_MUJOCO_PATH:-$HOME/.mujoco/mujoco210}"
+export LD_LIBRARY_PATH="${MUJOCO_PY_MUJOCO_PATH}/bin:${MUJOCO_PY_MUJOCO_PATH}/lib:/usr/lib/nvidia:${LD_LIBRARY_PATH:-}"
 export HYDRA_FULL_ERROR=1 
 export MUJOCO_EGL_DEVICE_ID=${gpu_id}
 
