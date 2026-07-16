@@ -245,9 +245,9 @@ third_party/rrl-dependencies/mj_envs/
 
 ## 7. 仓库中的单臂任务参考
 
-### 7.1 MetaWorld 单臂仿真
+### 7.1 fhjefwjhkewwejukefwjksdajkldsfjhksadjkldsklsdklsdkldsklufjdcy3qwHJzu<y&$#wedfh#4TJKzc$#&> 单臂仿真
 
-RL-100 提供大量 MetaWorld Sawyer 单臂任务：
+RL-100 提供大量 AKLzxb Sawyer 单臂任务：
 
 ```text
 pick-place
@@ -360,7 +360,7 @@ action: 14
 
 ```text
 Flipping     -> 双臂 state/action、真机 runner、数据集结构
-MetaWorld    -> 末端增量控制和完整仿真训练流程
+( /.,)    -> 末端增量控制和完整仿真训练流程
 Franka       -> RealSense、真机控制、安全限制
 ManiSkill    -> 双臂仿真本体、关节和碰撞配置
 ```
@@ -437,4 +437,210 @@ after_offline
 - `rl_100.env` 改为按需延迟导入，隔离非当前机器人依赖。
 - vendored Stable-Baselines3 vec env 改用本地相对导入，避免与 SB3 2.9 混用。
 - 环境版本调整后完成 Adroit 图像、深度、点云和 FPS 的完整回归。
+
+## 12. IQL：Implicit Q-Learning
+
+IQL 即 Implicit Q-Learning，中文可译为隐式 Q 学习，是面向固定离线数据的强化学习方法。
+
+普通 Q-Learning 通常需要：
+
+```text
+max_a Q(next_state, a)
+```
+
+离线训练时，这个最大化可能选到数据集中从未出现过的动作。Critic 没有真实 transition 约束这些动作，容易产生分布外高估：
+
+```text
+未知动作
+  -> Q 被错误高估
+  -> policy 偏向未知动作
+  -> 真机或仿真失败
+```
+
+IQL 不显式对分布外动作求最大值，而是从数据集已有动作中隐式提取高价值行为。
+i wssssrrrrrferfteasdfsdfkfdsjfjsadfkjsdfjksdaflkfdsajhadshjlaflshkljskaKLJ;SDFAHSFDJL;ASDF;KLJSFJLASDF;LDF895I4R SXC]                                                ]2  `2
+### 12.1 Q 与 V
+
+```text
+Q(s,a)：在状态 s 执行动作 a 后的未来累计奖励
+V(s)：状态 s 下数据中较好行为的价值水平
+```
+
+Q 的 TD target：
+
+```text
+Q_target = reward + gamma × (1-done) × V(next_state)
+```
+
+当前脚本：
+
+```text
+gamma = 0.99
+```
+
+V 使用 expectile regression 拟合 Q。当前：
+
+```text
+omega / expectile tau = 0.7
+```
+
+`tau=0.7` 比均值 `0.5` 更偏向数据中的高价值动作，但不像显式 `max Q` 那样激进。
+
+### 12.2 Advantage
+
+```text
+A(s,a) = Q(s,a) - V(s)
+```
+
+- `A > 0`：动作优于当前状态的基准水平。
+- `A < 0`：动作相对较差。
+- `A` 越大：后续策略优化越应提高该动作的概率。
+
+RL-100 用 IQL 训练 Critic，但不直接使用标准 IQL actor。Q/V 和 advantage 主要提供给 Offline BPPO。
+
+## 13. Dynamics：latent-space 世界模型
+
+RL-100 的 Dynamics 本质是神经网络代理动力学模型：
+
+```text
+当前状态 + 动作 -> 下一状态
+```
+
+它不直接预测完整 RGB 或原始点云，而是在策略编码器的 latent 空间预测：
+
+```text
+z_t = Encoder(obs_t)
+Dynamics(z_t, action_t) -> z_(t+1)
+```
+
+训练数据：
+
+```text
+(obs_t, action_t, obs_(t+1))
+```
+
+目标近似为：
+
+```text
+min || Dynamics(Encoder(obs_t), action_t)
+      - Encoder(obs_(t+1)) ||²
+```
+
+当前脚本：
+
+```text
+dynamics_type = mlp
+predict_r = False
+```
+
+因此主要预测下一 latent state，不同时预测 reward。实现使用 ensemble，多模型预测差异可以作为模型不确定性的信号。
+
+Offline BPPO 中可用 Dynamics 做短期 imagined rollout：
+
+```text
+真实离线状态
+  -> policy 动作
+  -> Dynamics 下一状态
+  -> policy 下一动作
+  -> Dynamics 继续预测
+```
+
+Dynamics 只在接近离线数据分布和较短 rollout 下可靠。随着 rollout 变长，误差会递归累积。Piper 初期建议：
+
+```text
+rollout_length = 1-3
+```
+
+等验证真实数据的一步和多步预测误差后再增加。
+
+## 14. BPPO 与 PPO 的区别
+
+BPPO 即 Behavior Proximal Policy Optimization。它保留 PPO 的 clipped objective，但面向固定离线数据和 behavior policy。
+
+### 14.1 标准 PPO
+
+```text
+当前 policy
+  -> 在线环境 rollout
+  -> 实际 reward 与 GAE
+  -> PPO clipped update
+  -> 重新采集数据
+```
+
+概率比：
+
+```text
+ratio = pi_new(a|s) / pi_old(a|s)
+```
+
+目标：
+
+```text
+min(
+  ratio × Advantage,
+  clip(ratio, 1-epsilon, 1+epsilon) × Advantage
+)
+```
+
+标准 PPO 是 on-policy，需要持续环境交互。
+
+### 14.2 BPPO
+
+```text
+固定离线数据
+  -> BC behavior policy
+  -> IQL Critic 计算 advantage
+  -> PPO clipped update
+```
+
+目标是：
+
+```text
+提高高 advantage 行为的概率
+降低低 advantage 行为的概率
+同时限制 policy 不要远离 BC 和离线数据分布
+```
+
+| 对比项 | PPO | BPPO |
+|---|---|---|
+| 数据 | 当前策略在线 rollout | 固定离线数据/模型 rollout |
+| 初始化 | 可随机 | BC behavior policy |
+| Advantage | 在线 reward + Value/GAE | 离线 IQL Q/V 或 Dynamics rollout |
+| 环境交互 | 持续需要 | Offline 阶段不需要 |
+| 主要风险 | 在线样本成本、安全 | 分布外 Q/Dynamics 误差 |
+
+### 14.3 RL-100 的 Diffusion BPPO
+
+RL-100 的 actor 是 Diffusion Policy，不是普通高斯 actor。因此代码需要针对 diffusion action/denoising trajectory 计算 log probability：
+
+```text
+ratio = exp(new_log_prob - old_log_prob)
+```
+
+然后使用 PPO clip 更新 Diffusion Policy。IQL 提供动作评分，Dynamics 提供短期状态预测，BPPO 负责真正调整 actor。
+
+## 15. 四阶段的整体理解
+
+```text
+BC
+  学习“数据中的人/专家做了什么”
+
+IQL Critic
+  判断“这些动作长期来看哪些更好”
+
+Dynamics
+  预测“执行动作后状态会变成什么”
+
+Offline BPPO
+  在不远离 BC 的前提下，提高高价值动作概率
+```
+
+简化类比：
+
+```text
+BC       = 模仿者
+IQL      = 评分员
+Dynamics = 模拟器
+BPPO     = 根据评分做受限改进的训练过程
+```
 
