@@ -863,6 +863,13 @@ class TrainDP3Workspace:
                     
                 # Update holdout losses and early stopping logic
                 dynamics._update_holdout_and_log(new_holdout_losses, np.mean(dynamics_losses), wandb_run, epoch)
+                # Keep dynamics metrics easy to find in WandB in addition to
+                # the legacy ``loss/...`` logger keys.
+                wandb_run.log({
+                    'dynamics_train_loss': float(np.mean(dynamics_losses)),
+                    'dynamics_val_loss': float(np.mean(new_holdout_losses)),
+                    'dynamics_epoch': epoch,
+                })
                 if (dynamics.cnt >= cfg.dynamics.max_epochs_since_update) or (cfg.dynamics.dynamics_max_epochs and (epoch >= cfg.dynamics.dynamics_max_epochs)):
                     break
             dynamics.post_well_learned()
@@ -1068,8 +1075,12 @@ class TrainDP3Workspace:
         best_bppo_path = self.unio4_output_dir
         os.makedirs(best_bppo_path, exist_ok=True)
         best_saved_scores = float('-inf')
-        run_idql_eval = bool(self.cfg.unio4.idql_eval)
-        run_ema_eval = bool(self.cfg.training.use_ema and self.ema_model is not None)
+        # Real-environment evaluation is optional for offline datasets.  A
+        # Piper dataset has no runner yet, so disable only the env-dependent
+        # eval branches and keep the Q/dynamics-based offline training.
+        has_env_runner = self.env_runner is not None
+        run_idql_eval = bool(self.cfg.unio4.idql_eval and has_env_runner)
+        run_ema_eval = bool(self.cfg.training.use_ema and self.ema_model is not None and has_env_runner)
         if run_idql_eval:
             idql_log_data = self.unio4_eval(
                 idql_eval = True,
@@ -1095,11 +1106,20 @@ class TrainDP3Workspace:
                 print('------------saved best EMA model----------------')
         else:
             ema_log_data = None
-        normal_log_data = self.eval(
-            eval_times=self.cfg.unio4.eval_times,
-            policy_override=self.unio4._policy,
-            eval_name='Policy Eval',
-        )
+        if has_env_runner:
+            normal_log_data = self.eval(
+                eval_times=self.cfg.unio4.eval_times,
+                policy_override=self.unio4._policy,
+                eval_name='Policy Eval',
+            )
+        else:
+            # There is no real success score without a runner.  Keep a
+            # numeric placeholder for the existing bookkeeping; policy
+            # selection below uses current_mean_qs instead.
+            normal_log_data = {
+                'test_mean_score': 0.0,
+                'mean_returns': 0.0,
+            }
         
         # Save/select best checkpoint by the actual offline finetuned policy
         best_bppo_scores = normal_log_data['test_mean_score']
@@ -1174,7 +1194,7 @@ class TrainDP3Workspace:
                 ema.step(self.unio4._policy)
             wandb.log({'dpg_loss': losses})
             # evaluation during training
-            if (step+1) % self.cfg.unio4.eval_freq == 0:
+            if (step+1) % self.cfg.unio4.eval_freq == 0 and has_env_runner:
                 if run_idql_eval:
                     idql_log_data = self.unio4_eval(
                         idql_eval = True,
@@ -1256,6 +1276,17 @@ class TrainDP3Workspace:
                 wandb.log({'current_mean_qs': current_mean_qs})
                 print('rollout trajectory q mean:{}'.format(current_mean_qs))
                 print(f"Step: {step}, Loss: ", losses)
+                if not has_env_runner:
+                    current_mean_q_value = float(torch.as_tensor(current_mean_qs).mean().item())
+                    best_mean_q_value = float(torch.as_tensor(best_mean_qs).mean().item())
+                    if current_mean_q_value > best_mean_q_value:
+                        best_mean_qs = current_mean_qs
+                        os.makedirs(self.offline_best_path, exist_ok=True)
+                        self.unio4.save(self.offline_best_path)
+                        print(
+                            '------------saved best offline model by dynamics mean Q: '
+                            f'{current_mean_q_value:.6f}------------'
+                        )
                 if self.cfg.unio4.is_update_old_policy:
                     if current_mean_qs > best_mean_qs:
                         best_mean_qs = current_mean_qs

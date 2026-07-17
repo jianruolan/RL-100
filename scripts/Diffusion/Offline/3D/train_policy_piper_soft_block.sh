@@ -10,6 +10,9 @@ addition_info="${3:-fixed}"
 seed="${4:-42}"
 exp_name="${task_name}-${alg_name}-${addition_info}"
 gpu_id="${GPU_ID:-0}"
+run_dir="${RUN_DIR:-data/outputs/${exp_name}_seed${seed}}"
+resume="${RESUME:-False}"
+offline="${OFFLINE:-False}"
 
 cd "$(dirname "$0")/../../../.."
 cd RL-100
@@ -24,7 +27,7 @@ export CUDA_VISIBLE_DEVICES="${gpu_id}"
 # Deliberately no hyperparameter loops: one reproducible configuration.
 python train.py --config-name=rl100_3d_epsilon.yaml \
   task="${task_name}" \
-  hydra.run.dir="data/outputs/${exp_name}_seed${seed}" \
+  hydra.run.dir="${run_dir}" \
   training.debug=False \
   training.seed="${seed}" \
   training.device=cuda:0 \
@@ -32,11 +35,12 @@ python train.py --config-name=rl100_3d_epsilon.yaml \
   logging.mode=online \
   use_wandb=True \
   checkpoint.save_ckpt=True \
-  training.resume=False \
+  training.resume="${resume}" \
   horizon=3 n_obs_steps=3 n_action_steps=1 \
-  chunk_as_single_action=False \
+  chunk_as_single_action=True \
+  dynamics.prediction_mode=full \
   only_bc=True \
-  offline=False online=False \
+  offline="${offline}" online=False \
   policy._target_=rl_100.policy.rl100_3d.RL1003D \
   policy.encoder_type=dp3vib \
   policy.model=skipnet \
