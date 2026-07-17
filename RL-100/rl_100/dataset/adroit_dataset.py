@@ -34,9 +34,11 @@ class AdroitDataset(BaseDataset):
             scale_strategy=None,
             pre_image_norm=False,
             sequence_stride=1,
+            controlled_dims=None,
             ):
         super().__init__()
         self.task_name = task_name
+        self.controlled_dims = controlled_dims
         self.replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path, keys=['state', 'action', 'point_cloud', 'img', 'next_state', 'next_action', 'next_point_cloud', 'next_img', 'reward', 'done', 'timeout', 'return'])
         # construct scaled reward and return
@@ -110,13 +112,14 @@ class AdroitDataset(BaseDataset):
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):
+        dim_slice = slice(None, self.controlled_dims)
         data = {
-            'action': self.replay_buffer['action'],
-            'agent_pos': self.replay_buffer['state'][...,:],
+            'action': self.replay_buffer['action'][..., dim_slice],
+            'agent_pos': self.replay_buffer['state'][..., dim_slice],
             'point_cloud': self.replay_buffer['point_cloud'],
 
-            'next_action': self.replay_buffer['next_action'],
-            'next_agent_pos': self.replay_buffer['next_state'][...,:],
+            'next_action': self.replay_buffer['next_action'][..., dim_slice],
+            'next_agent_pos': self.replay_buffer['next_state'][..., dim_slice],
             'next_point_cloud': self.replay_buffer['next_point_cloud'],
 
             # 'reward': self.replay_buffer['reward'],
@@ -131,11 +134,12 @@ class AdroitDataset(BaseDataset):
         return len(self.sampler)
 
     def _sample_to_data(self, sample):
-        agent_pos = sample['state'][:,].astype(np.float32) # (agent_posx2, block_posex3)
+        dim_slice = slice(None, self.controlled_dims)
+        agent_pos = sample['state'][:, dim_slice].astype(np.float32) # (agent_posx2, block_posex3)
         point_cloud = sample['point_cloud'][:,].astype(np.float32) # (T, 1024, 6)
         image = sample['img'][:,].astype(np.float32) # (T, 3, 64, 64)
         
-        next_agent_pos = sample['next_state'][:,].astype(np.float32) # (agent_posx2, block_posex3)
+        next_agent_pos = sample['next_state'][:, dim_slice].astype(np.float32) # (agent_posx2, block_posex3)
         next_point_cloud = sample['next_point_cloud'][:,].astype(np.float32) # (T, 1024, 6)
         next_image = sample['next_img'][:,].astype(np.float32) # (T, 3, 64, 64)
 
@@ -153,14 +157,15 @@ class AdroitDataset(BaseDataset):
             'reward': sample['reward'].astype(np.float32), # T, D_action
             'not_done': 1. - sample['done'].astype(np.bool_), # T, D_action
             'return': sample['return'].astype(np.float32), # T, D_action
-            'action': sample['action'].astype(np.float32), # T, D_action
-            'next_action': sample['next_action'].astype(np.float32) # T, D_action
+            'action': sample['action'][:, dim_slice].astype(np.float32), # T, D_action
+            'next_action': sample['next_action'][:, dim_slice].astype(np.float32) # T, D_action
         }
 
         return data
     def get_shape_info(self, n_action_steps, n_obs_steps):
         sample = self.sampler.sample_sequence(10)
-        agent_pos = sample['state'][:,].astype(np.float32) # (agent_posx2, block_posex3)
+        dim_slice = slice(None, self.controlled_dims)
+        agent_pos = sample['state'][:, dim_slice].astype(np.float32) # (agent_posx2, block_posex3)
         point_cloud = sample['point_cloud'][:,].astype(np.float32) # (T, 1024, 6)
         image = sample['img'][:,].astype(np.float32) # (T, 3, 64, 64)
 
@@ -170,7 +175,7 @@ class AdroitDataset(BaseDataset):
             'agent_pos': (n_obs_steps,) + agent_pos.shape[1:],
             'image': (n_obs_steps,) + image.shape[1:],
         },
-        'action': (n_action_steps, sample['action'].shape[-1]),
+        'action': (n_action_steps, sample['action'][:, dim_slice].shape[-1]),
         }
         return shape_info
     def get_all_data(self,) -> Dict[str, torch.Tensor]:
@@ -187,4 +192,3 @@ class AdroitDataset(BaseDataset):
         data = self._sample_to_data(sample)
         torch_data = dict_apply(data, torch.from_numpy)
         return torch_data
-

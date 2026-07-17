@@ -30,8 +30,9 @@ cm_inference_steps: 1
 clip_std_min: 0.0067
 clip_std_max: null # 0.8
 action_norm: True
-env_num: ${task.env_runner.env_num}
+env_num: 1
 only_bc: False
+run_validation: True
 offline_use_aug: True
 update_phase: 'step' # 'step', 'iteration'
 distill_loss_type: 'action_same_noise' # 'action' 'back_up'
@@ -275,6 +276,8 @@ training:
 
 
 logging:
+  # null uses the entity associated with the currently logged-in WandB user.
+  entity: null
   group: ${exp_name}
   id: null
   mode: online

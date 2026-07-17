@@ -3,7 +3,7 @@ if __name__ == "__main__":
     import os
     import pathlib
 
-    ROOT_DIR = str(pathlib.Path(__file__).parent.parent.parent)
+    ROOT_DIR = str(pathlib.Path(__file__).resolve().parent)
     sys.path.append(ROOT_DIR)
     os.chdir(ROOT_DIR)
 import argparse
@@ -103,7 +103,15 @@ def init_wandb_run(cfg, output_dir):
         )
 
     try:
-        return _wandb_init(init_timeout)
+        run = _wandb_init(init_timeout)
+        # WANDB_SILENT suppresses WandB's own startup banner, so print the
+        # useful run identity explicitly for online runs.
+        run_url = getattr(run, "url", None)
+        run_id = getattr(run, "id", None)
+        if run_url:
+            print(f"[WandB] run: {run.name} (id={run_id})")
+            print(f"[WandB] url: {run_url}")
+        return run
     except wandb.errors.CommError as exc:
         if "timeout" not in str(exc).lower():
             raise
@@ -111,7 +119,13 @@ def init_wandb_run(cfg, output_dir):
             f"[WandB] init timed out after {init_timeout}s, retrying with {retry_init_timeout}s",
             "yellow",
         )
-        return _wandb_init(retry_init_timeout)
+        run = _wandb_init(retry_init_timeout)
+        run_url = getattr(run, "url", None)
+        run_id = getattr(run, "id", None)
+        if run_url:
+            print(f"[WandB] run: {run.name} (id={run_id})")
+            print(f"[WandB] url: {run_url}")
+        return run
 
 class TrainDP3Workspace:
     include_keys = ['global_step', 'epoch']
@@ -339,7 +353,7 @@ class TrainDP3Workspace:
             verbose = False
         
         self.verbose = verbose
-        RUN_VALIDATION = False # reduce time cost
+        RUN_VALIDATION = getattr(cfg, 'run_validation', True)
         self.RUN_ROLLOUT = RUN_ROLLOUT
         self.RUN_VALIDATION = RUN_VALIDATION
         self.output_dir = self.output_dir()
@@ -458,6 +472,11 @@ class TrainDP3Workspace:
                 },
                 allow_val_change=True
             )
+        else:
+            # Keep the logging interface available: the training loop logs
+            # step metrics unconditionally, while offline smoke tests often
+            # disable external WandB connectivity.
+            wandb_run = wandb.init(mode="disabled")
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(
@@ -764,8 +783,12 @@ class TrainDP3Workspace:
         elif prediction_mode == "full" and self.cfg.n_obs_steps > 1:
             # Keep action_embed_dim at single-step feature_dim to avoid scaling the action encoder.
             self.cfg.lddm.action_embed_dim = self.model.obs_feature_dim
+        # Offline-only tasks (for example a dataset collected on a real
+        # Piper) do not have an environment runner.  Dynamics training can
+        # still use the dataset; termination functions receive None.
+        dynamics_env = env_runner.env if env_runner is not None else None
         dynamics =  train_dynamics(
-            env_runner.env, 
+            dynamics_env,
             self.model.normalizer, 
             dynamics_encoder, 
             dynamics_path, 

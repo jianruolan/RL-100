@@ -40,8 +40,11 @@ flow_cps_logprob_mode: 'gaussian'  # "pseudo" (Plan A: scaled MSE) or "gaussian"
 clip_std_min: 0.0067
 clip_std_max: null
 action_norm: True
-env_num: ${task.env_runner.env_num}
+# Global fallback used by offline-only tasks. Individual runners keep their
+# own task.env_runner.env_num setting.
+env_num: 1
 only_bc: False
+run_validation: True
 offline_use_aug: True
 update_phase: 'step'
 distill_loss_type: 'action_same_noise'
@@ -293,6 +296,8 @@ training:
 
 
 logging:
+  # null uses the entity associated with the currently logged-in WandB user.
+  entity: null
   group: ${exp_name}
   id: null
   mode: online
