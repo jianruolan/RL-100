@@ -5,9 +5,9 @@
 相关背景文档：
 
 ```text
-docs/project_flow.md
-docs/dataset_guide.md
-docs/robot_adaptation.md
+docs/RL-100项目流程.md
+docs/数据集指南.md
+docs/机器人适配清单.md
 ```
 
 ## 1. 目标范围

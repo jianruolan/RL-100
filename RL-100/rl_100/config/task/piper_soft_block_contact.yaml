@@ -26,7 +26,7 @@ env_runner: null
 
 dataset: &dataset
   _target_: rl_100.dataset.adroit_dataset.AdroitDataset
-  zarr_path: data/piper_soft_block_contact_all.zarr
+  zarr_path: data/piper_soft_block_contact_50.zarr
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}

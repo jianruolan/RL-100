@@ -488,7 +488,7 @@ obs[t] 对应 [t,t+1) 实际下发 action
 按已有数据方案执行：
 
 ```text
-docs/piper_pico_pick_place_data_collection_plan.md
+docs/Piper双臂抓放数据采集方案.md
 ```
 
 顺序：
