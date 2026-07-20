@@ -1,7 +1,11 @@
 import cv2
 import time
 import numpy as np
-import viser
+try:
+    import viser
+except ImportError:
+    # 真机采集/推理不依赖 viser；它只用于本文件末尾的可视化 demo。
+    viser = None
 from scipy.spatial.transform import Rotation as R
 import pyrealsense2 as rs
 import fpsample
@@ -172,6 +176,8 @@ class RealSense(object):
 
 
 if __name__ == '__main__':
+    if viser is None:
+        raise RuntimeError("运行 RealSense 可视化 demo 需要先安装 viser")
     camera = RealSense()
     camera.start()
     
