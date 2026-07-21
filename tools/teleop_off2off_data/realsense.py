@@ -73,6 +73,19 @@ X_root_camera = np.array([
 # X_root_camera[:3, :3] = rot_mat
 
 
+def point_cloud_pose(point_cloud_frame):
+    """返回 depth2pc 使用的坐标变换；camera 与训练转换保持一致。"""
+
+    if point_cloud_frame == "camera":
+        return np.eye(4, dtype=np.float64)
+    if point_cloud_frame == "root":
+        return X_root_camera
+    raise ValueError(
+        "point_cloud_frame must be 'camera' or 'root', "
+        f"got {point_cloud_frame!r}"
+    )
+
+
 class RealSense(object):
     def __init__(
         self,
@@ -81,13 +94,16 @@ class RealSense(object):
         depth_height=480,
         color_width=640,
         color_height=480,
-        num_points=1024
+        num_points=1024,
+        point_cloud_frame="root",
     ):
+        point_cloud_pose(point_cloud_frame)
         self.depth_width = depth_width
         self.depth_height = depth_height
         self.color_width = color_width
         self.color_height = color_height
         self.num_points = num_points
+        self.point_cloud_frame = point_cloud_frame
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
@@ -160,18 +176,30 @@ class RealSense(object):
         depth_image = np.array(depth_frame.get_data())
         color_image = np.array(color_frame.get_data())
 
-        point_cloud = point_cloud_downsample(depth2pc(
-            depth_image * self.depth_scale,
-            self.depth_intrinsics,
-            X_root_camera
-        ), self.num_points) if require_pc else None
+        if require_pc:
+            # Piper raw->zarr conversion calls depth2pc(depth, intrinsics)
+            # without an extrinsic, so deployment must select "camera" to
+            # reproduce the exact same coordinate convention.  "root" keeps
+            # the legacy fixed-X_root_camera behavior for existing utilities.
+            camera_pose = point_cloud_pose(self.point_cloud_frame)
+            point_cloud = point_cloud_downsample(
+                depth2pc(
+                    depth_image * self.depth_scale,
+                    self.depth_intrinsics,
+                    camera_pose,
+                ),
+                self.num_points,
+            )
+        else:
+            point_cloud = None
 
         return {
             'timestamp': timestamp,
             'color': color_image,
             'depth': depth_image,
             'depth_scale': self.depth_scale,
-            'point_cloud': point_cloud
+            'point_cloud': point_cloud,
+            'point_cloud_frame': self.point_cloud_frame,
         }
 
 

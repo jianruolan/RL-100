@@ -42,11 +42,11 @@ from omegaconf import OmegaConf
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parents[2]
 TRAIN_ROOT = REPO_ROOT / "RL-100"
-DEFAULT_OUTPUT_DIR = TRAIN_ROOT / "data/outputs/piper_soft_block_contact_50_seed42"
-DEFAULT_PIPER_SDK_ROOT = REPO_ROOT.parent / "piper_sdk"
+PYTORCH3D_ROOT = REPO_ROOT / "third_party/pytorch3d_simplified"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "data/outputs/piper_soft_block_contact_50_seed42"
 
 # 保证从任意工作目录启动时都能导入 RL-100 和 tools。
-for path in (str(REPO_ROOT), str(TRAIN_ROOT)):
+for path in (str(REPO_ROOT), str(TRAIN_ROOT), str(PYTORCH3D_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
@@ -76,6 +76,18 @@ class TrainingStats:
     point_cloud_high: np.ndarray
 
 
+@dataclass(frozen=True)
+class PiperArmStatus:
+    """从 Piper SDK 二次封装对象中提取出的稳定整数状态。"""
+
+    hz: float
+    ctrl_mode: int
+    arm_status: int
+    mode_feed: int
+    teach_status: int
+    motion_status: int
+
+
 class PiperStateReader:
     """只读取 Piper 当前六关节位置，不对机器人状态做任何修改。"""
 
@@ -101,6 +113,31 @@ class PiperStateReader:
             raise RuntimeError(f"机械臂关节状态包含 NaN/Inf: {joint_rad}")
         sdk_timestamp = float(getattr(msg, "time_stamp", 0.0))
         return joint_rad, sdk_timestamp
+
+
+def _sdk_enum_value(value: Any) -> int:
+    """兼容 Piper SDK 的 IntEnum 字段和旧版整数状态字段。"""
+
+    return int(getattr(value, "value", value))
+
+
+def read_piper_arm_status(piper: Any) -> PiperArmStatus:
+    """读取 GetArmStatus() 的内层 arm_status，而不是误读外层包装对象。"""
+
+    feedback = piper.GetArmStatus()
+    status = getattr(feedback, "arm_status", None)
+    if status is None or not hasattr(status, "ctrl_mode"):
+        raise RuntimeError(
+            "Piper GetArmStatus() 返回结构异常，缺少 arm_status.ctrl_mode"
+        )
+    return PiperArmStatus(
+        hz=float(getattr(feedback, "Hz", 0.0)),
+        ctrl_mode=_sdk_enum_value(status.ctrl_mode),
+        arm_status=_sdk_enum_value(status.arm_status),
+        mode_feed=_sdk_enum_value(status.mode_feed),
+        teach_status=_sdk_enum_value(status.teach_status),
+        motion_status=_sdk_enum_value(status.motion_status),
+    )
 
 
 class OperatorConsole:
@@ -132,18 +169,20 @@ class OperatorConsole:
             return None
 
 
-def import_piper_sdk(sdk_root: Path):
-    """从用户指定目录导入 Piper SDK，避免依赖全局 Python 环境。"""
+def import_piper_sdk(sdk_root: Path | None):
+    """优先使用显式源码目录，否则导入全局安装的 Piper SDK。"""
 
-    sdk_root = sdk_root.expanduser().resolve()
-    if not sdk_root.exists():
-        raise FileNotFoundError(f"Piper SDK 目录不存在: {sdk_root}")
-    if str(sdk_root) not in sys.path:
-        sys.path.insert(0, str(sdk_root))
+    if sdk_root is not None:
+        sdk_root = sdk_root.expanduser().resolve()
+        if not sdk_root.exists():
+            raise FileNotFoundError(f"Piper SDK 目录不存在: {sdk_root}")
+        if str(sdk_root) not in sys.path:
+            sys.path.insert(0, str(sdk_root))
     try:
         from piper_sdk import C_PiperInterface_V2
     except ImportError as exc:
-        raise RuntimeError(f"无法从 {sdk_root} 导入 piper_sdk") from exc
+        source = str(sdk_root) if sdk_root is not None else "当前 Python 全局环境"
+        raise RuntimeError(f"无法从 {source} 导入 piper_sdk") from exc
     return C_PiperInterface_V2
 
 
@@ -151,7 +190,17 @@ def resolve_training_path(path_value: str | Path) -> Path:
     """训练配置里的相对路径以 RL-100 内层训练目录为基准。"""
 
     path = Path(path_value).expanduser()
-    return path.resolve() if path.is_absolute() else (TRAIN_ROOT / path).resolve()
+    if path.is_absolute():
+        return path.resolve()
+
+    # 训练脚本通常从 RL-100/ 内层目录运行，但本项目的数据也可能放在
+    # 仓库顶层 data/（当前 Piper zarr 就是这种布局）。按存在性优先选择，
+    # 避免切换 cwd 后把顶层 data 错解析成 RL-100/data。
+    candidates = [Path.cwd() / path, REPO_ROOT / path, TRAIN_ROOT / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return (TRAIN_ROOT / path).resolve()
 
 
 def load_policy_and_dataset(
@@ -176,6 +225,13 @@ def load_policy_and_dataset(
     )
     cfg = OmegaConf.load(config_path)
     OmegaConf.resolve(cfg)
+
+    # Hydra 配置中的 zarr_path 是相对路径；先解析为实际文件，再切换到
+    # RL-100 内层目录实例化 AdroitDataset。
+    if "zarr_path" in cfg.task.dataset:
+        cfg.task.dataset.zarr_path = str(
+            resolve_training_path(cfg.task.dataset.zarr_path)
+        )
 
     # AdroitDataset 只是本项目通用的 zarr reader；Piper 配置通过
     # controlled_dims=6 丢弃恒定的第七维夹爪通道。
@@ -356,37 +412,128 @@ def safe_joint_target(
     return target.astype(np.float32), warnings
 
 
-def send_joint_target(piper: Any, target_rad: np.ndarray) -> None:
-    """Piper JointCtrl 使用 0.001 degree 整数单位。"""
+def send_joint_target(
+    piper: Any,
+    target_rad: np.ndarray,
+    speed_percent: int,
+) -> None:
+    """严格按 Piper SDK demo，每周期先声明 CAN/MOVE J 再发送 JointCtrl。"""
 
     raw = np.rint(np.asarray(target_rad, dtype=np.float64) * RAD_TO_RAW).astype(np.int64)
+    piper.MotionCtrl_2(0x01, 0x01, int(speed_percent), 0x00)
     piper.JointCtrl(*[int(value) for value in raw])
 
 
 def enable_robot_for_position_control(piper: Any, speed_percent: int, timeout: float) -> None:
-    """显式使能并进入关节位置控制；调用前必须通过人工确认。"""
+    """退出残留示教模式，使能，并验证已进入 CAN/MOVE J 位置控制。"""
 
-    piper.EnablePiper()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if bool(piper.EnablePiper()):
-            break
-        time.sleep(0.1)
-    else:
-        raise RuntimeError("Piper 在超时时间内未成功使能")
+    status = read_piper_arm_status(piper)
+    while status.hz <= 0 and time.monotonic() < deadline:
+        time.sleep(0.05)
+        status = read_piper_arm_status(piper)
+    if status.hz <= 0:
+        raise RuntimeError("等待 Piper 0x2A1 状态反馈超时，拒绝切换控制模式")
 
-    # 解除可能残留的急停状态，然后选择 CAN 控制 + 关节位置模式。
-    piper.MotionCtrl_1(0x02, 0x00, 0x00)
-    piper.MotionCtrl_2(0x01, 0x01, int(speed_percent), 0x00)
+    print(
+        "[Piper] 切换前状态: "
+        f"ctrl_mode=0x{status.ctrl_mode:02X}, "
+        f"arm_status=0x{status.arm_status:02X}, "
+        f"teach_status=0x{status.teach_status:02X}, Hz={status.hz:.1f}",
+        flush=True,
+    )
+    if status.arm_status == 0x01:
+        raise RuntimeError(
+            "Piper 当前仍处于 EMERGENCY_STOP；拒绝进入位置控制。"
+            "请先托住机械臂，并按 Piper SDK 恢复急停后再重试。"
+        )
+    if status.arm_status not in (0x00, 0x0B):
+        raise RuntimeError(
+            f"Piper 当前 arm_status=0x{status.arm_status:02X}，不是正常/示教记录状态；"
+            "拒绝进入位置控制"
+        )
+
+    # 采集结束后固件可能仍反馈 TEACHING_MODE。Piper SDK 明确定义
+    # grag_teach_ctrl=0x02 为“结束示教记录（退出拖动示教模式）”。
+    # 这里的 emergency_stop 字段保持 0x00，绝不调用会失力的 ResetPiper。
+    if status.ctrl_mode == 0x02 or status.teach_status == 0x01:
+        print("[Piper] 退出残留拖动示教模式", flush=True)
+        piper.MotionCtrl_1(0x00, 0x00, 0x02)
+        time.sleep(0.1)
+
+    # 官方 piper_ctrl_joint.py 在循环中持续发送 EnablePiper，并在每个
+    # JointCtrl 前发送 MotionCtrl_2(CAN_CTRL, MOVE_J, speed, position mode)。
+    # 这里先重复发送并等待 0x2A1 明确反馈 CAN_CTRL，未切换成功则不下发动作。
+    last_status = status
+    enabled = False
+    while time.monotonic() < deadline:
+        enabled = bool(piper.EnablePiper())
+        piper.MotionCtrl_2(0x01, 0x01, int(speed_percent), 0x00)
+        time.sleep(0.02)
+        last_status = read_piper_arm_status(piper)
+        if last_status.arm_status == 0x01:
+            raise RuntimeError("Piper 在模式切换期间进入 EMERGENCY_STOP")
+        if enabled and last_status.ctrl_mode == 0x01 and last_status.mode_feed == 0x01:
+            print(
+                "[Piper] 已进入 CAN/MOVE J 控制: "
+                f"ctrl_mode=0x{last_status.ctrl_mode:02X}, "
+                f"mode_feed=0x{last_status.mode_feed:02X}, "
+                f"enable_status={list(piper.GetArmEnableStatus())}",
+                flush=True,
+            )
+            return
+
+    raise RuntimeError(
+        "Piper 未在超时时间内进入 CAN 指令控制模式；不会发送 JointCtrl。"
+        f" enable={enabled}, ctrl_mode=0x{last_status.ctrl_mode:02X},"
+        f" arm_status=0x{last_status.arm_status:02X},"
+        f" teach_status=0x{last_status.teach_status:02X}"
+    )
 
 
 def quick_stop(piper: Any) -> None:
-    """请求 Piper 快速停止；故意不 Disable，避免机械臂失去保持力。"""
+    """发送 Piper SDK 硬急停；固件可能进入失力状态。"""
 
     try:
         piper.MotionCtrl_1(0x01, 0x00, 0x00)
     except Exception as exc:
         print(f"[安全] quick stop 发送失败: {exc}", file=sys.stderr, flush=True)
+
+
+def stop_and_hold_position(
+    piper: Any,
+    state_reader: PiperStateReader,
+    fallback_joint_rad: np.ndarray,
+    speed_percent: int,
+    hold_seconds: float = 0.5,
+    command_hz: float = 50.0,
+) -> None:
+    """停止更新策略目标，并在位置模式下保持当前关节姿态和电机使能。"""
+
+    hold_target = np.asarray(fallback_joint_rad, dtype=np.float32)
+    try:
+        current_joint, _ = state_reader.read_joint_rad()
+        if np.all(np.isfinite(current_joint)):
+            hold_target = current_joint
+    except Exception as exc:
+        print(
+            f"[保持] 读取停止姿态失败，使用最后有效关节姿态: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # 严格沿用 Piper SDK 的 CAN 控制 + MOVE J 关节位置模式，不发送
+    # MotionCtrl_1(0x01) 硬急停，也不调用 DisablePiper。
+    repeats = max(1, int(round(hold_seconds * command_hz)))
+    period = 1.0 / command_hz
+    for _ in range(repeats):
+        send_joint_target(piper, hold_target, speed_percent)
+        time.sleep(period)
+    print(
+        f"[保持] 已停止策略更新并保持当前位置，机械臂维持使能: "
+        f"{np.round(hold_target, 5)}",
+        flush=True,
+    )
 
 
 def save_run_log(log_path: Path, records: list[dict[str, Any]], meta: dict[str, Any]) -> None:
@@ -420,7 +567,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--offline-smoke", action="store_true")
     parser.add_argument("--can", default="can0")
-    parser.add_argument("--piper-sdk-root", type=Path, default=DEFAULT_PIPER_SDK_ROOT)
+    parser.add_argument(
+        "--piper-sdk-root",
+        type=Path,
+        default=None,
+        help="可选；不传时使用当前 Python 环境中全局安装的 piper_sdk。",
+    )
     parser.add_argument("--rate", type=float, default=20.0)
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--max-steps", type=int, default=200)
@@ -495,11 +647,15 @@ def main() -> None:
         depth_width=640,
         depth_height=480,
         num_points=512,
+        # 训练 zarr 由 depth2pc(depth, intrinsics) 生成，点云位于 D435i
+        # 相机坐标系；腕部相机不能使用固定 X_root_camera 外参。
+        point_cloud_frame="camera",
     )
+    print("[相机] 点云坐标系: camera（与训练 zarr 一致）", flush=True)
     camera.start()
 
     print("\n[模式]", "真机执行" if args.execute else "影子模式（绝不下发动作）", flush=True)
-    print("[人工] 运行中直接按 Enter：普通停止；输入 q/estop：快速急停。", flush=True)
+    print("[人工] Enter/q：停止策略并保持使能；输入 estop：SDK 硬急停（可能失力）。", flush=True)
     print("[安全] 请确保急停可触达、机械臂周围无人、工作空间无障碍物。", flush=True)
 
     robot_enabled_by_script = False
@@ -509,6 +665,9 @@ def main() -> None:
     last_sdk_timestamp: float | None = None
     last_fresh_state_host_time = time.monotonic()
     next_deadline = time.monotonic()
+    last_valid_joint = np.zeros(6, dtype=np.float32)
+    hard_emergency_sent = False
+    stop_reason = "max_steps"
 
     try:
         # 连续采集三帧，而不是把第一帧简单复制三次，尽量匹配训练时间窗。
@@ -529,6 +688,7 @@ def main() -> None:
             time.sleep(1.0 / args.rate)
 
         initial_joint = history[-1]["agent_pos"]
+        last_valid_joint = initial_joint.copy()
         # 即使在影子模式也检查初始姿态，提前暴露训练/部署范围不一致。
         safe_joint_target(
             initial_joint,
@@ -558,17 +718,21 @@ def main() -> None:
         next_deadline = time.monotonic()
         for step in range(args.max_steps):
             command = operator.poll()
-            if command in {"q", "quit", "e", "estop", "emergency"}:
+            if command in {"e", "estop", "emergency"}:
                 if robot_enabled_by_script:
                     quick_stop(piper)
-                print("[人工] 收到急停命令", flush=True)
+                    hard_emergency_sent = True
+                stop_reason = "hard_emergency"
+                print("[人工] 收到 SDK 硬急停命令；机械臂可能失力", flush=True)
                 break
-            if command in {"stop", "s"}:
-                print("[人工] 收到普通停止命令", flush=True)
+            if command in {"stop", "s", "q", "quit"}:
+                stop_reason = "operator_hold"
+                print("[人工] 收到停止命令，将保持当前位置和使能", flush=True)
                 break
 
             loop_start = time.monotonic()
             current_joint, sdk_timestamp = state_reader.read_joint_rad()
+            last_valid_joint = current_joint.copy()
             if last_sdk_timestamp is None or sdk_timestamp != last_sdk_timestamp:
                 last_sdk_timestamp = sdk_timestamp
                 last_fresh_state_host_time = loop_start
@@ -607,7 +771,20 @@ def main() -> None:
             )
 
             if robot_enabled_by_script:
-                send_joint_target(piper, target)
+                send_joint_target(piper, target, args.speed_percent)
+
+            arm_status = read_piper_arm_status(piper)
+            if arm_status.arm_status == 0x01:
+                raise RuntimeError("Piper 反馈 EMERGENCY_STOP，停止策略循环")
+            if robot_enabled_by_script and (
+                arm_status.ctrl_mode != 0x01 or arm_status.mode_feed != 0x01
+            ):
+                raise RuntimeError(
+                    "Piper 已离开 CAN/MOVE J 指令控制模式，停止策略循环。"
+                    f" ctrl_mode=0x{arm_status.ctrl_mode:02X},"
+                    f" mode_feed=0x{arm_status.mode_feed:02X},"
+                    f" arm_status=0x{arm_status.arm_status:02X}"
+                )
 
             record = {
                 "step": step,
@@ -619,6 +796,14 @@ def main() -> None:
                 "point_outlier_fraction": outlier_fraction,
                 "safety_warnings": safety_warnings,
                 "executed": robot_enabled_by_script,
+                "piper_status": {
+                    "hz": arm_status.hz,
+                    "ctrl_mode": arm_status.ctrl_mode,
+                    "arm_status": arm_status.arm_status,
+                    "mode_feed": arm_status.mode_feed,
+                    "teach_status": arm_status.teach_status,
+                    "motion_status": arm_status.motion_status,
+                },
             }
             records.append(record)
             print(
@@ -626,6 +811,7 @@ def main() -> None:
                 f"pred={np.round(predicted, 4)} "
                 f"target={np.round(target, 4)} "
                 f"pc_out={outlier_fraction:.1%} "
+                f"mode=0x{arm_status.ctrl_mode:02X} "
                 f"{'EXEC' if robot_enabled_by_script else 'SHADOW'}",
                 flush=True,
             )
@@ -643,16 +829,27 @@ def main() -> None:
                 )
 
     except KeyboardInterrupt:
-        print("\n[人工] Ctrl-C，停止推理", flush=True)
-        if robot_enabled_by_script:
-            quick_stop(piper)
-    except Exception:
-        if robot_enabled_by_script:
-            quick_stop(piper)
+        stop_reason = "keyboard_interrupt_hold"
+        print("\n[人工] Ctrl-C，停止策略并保持当前位置和使能", flush=True)
+    except Exception as exc:
+        stop_reason = f"exception_hold:{type(exc).__name__}"
         raise
     finally:
-        if robot_enabled_by_script:
-            quick_stop(piper)
+        if robot_enabled_by_script and not hard_emergency_sent:
+            try:
+                stop_and_hold_position(
+                    piper=piper,
+                    state_reader=state_reader,
+                    fallback_joint_rad=last_valid_joint,
+                    speed_percent=args.speed_percent,
+                )
+            except Exception as exc:
+                # 不自动降级为 MotionCtrl_1(0x01)；硬急停可能让机械臂失力。
+                print(
+                    f"[保持] 发送保持指令失败，但不会自动硬急停或失能: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         try:
             camera.stop()
         except Exception as exc:
@@ -671,6 +868,9 @@ def main() -> None:
                 "execute": args.execute,
                 "max_joint_speed_rad_s": args.max_joint_speed_rad_s,
                 "dataset_margin_rad": args.dataset_margin_rad,
+                "point_cloud_frame": "camera",
+                "stop_reason": stop_reason,
+                "hard_emergency_sent": hard_emergency_sent,
             },
         )
 
