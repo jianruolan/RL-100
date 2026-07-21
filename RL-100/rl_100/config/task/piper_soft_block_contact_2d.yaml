@@ -1,10 +1,12 @@
-name: piper_soft_block_contact
+name: piper_soft_block_contact_2d
 
 task_name: piper_soft_block_contact
 
-# Processed dataset schema:
-#   raw state/action: 7 (six arm joints plus a constant gripper channel)
-#   image: 3x84x84, point_cloud: 512x3
+# 纯离线的 Piper 2D 任务配置。
+# Zarr 仍保留 point_cloud，便于与 3D 实验共用数据；RL1002D 的
+# policy.w_pc=False 会忽略点云，只编码 RGB 图像和六维关节位置。
+crop_shape: null
+
 shape_meta: &shape_meta
   obs:
     image:
@@ -19,9 +21,8 @@ shape_meta: &shape_meta
   action:
     shape: [6]
 
-# Stage 1 is deliberately offline-only.  A real Piper runner must implement
-# reset/step, D435i preprocessing, safety limits, and contact termination
-# before rollout evaluation or online RL is enabled.
+# 尚未实现真机环境 runner。训练中的仿真/真机 rollout 会被跳过，
+# validation 仍然使用按 episode 划分出的离线验证集。
 env_runner: null
 
 dataset: &dataset
@@ -30,12 +31,11 @@ dataset: &dataset
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
-  seed: 42
-  # Eight episodes: reserve one complete episode for validation.
-  val_ratio: 0.125
+  seed: ${training.seed}
+  # 50 条轨迹中固定留出约 5 条完整 episode 做验证，避免帧级数据泄漏。
+  val_ratio: 0.1
   max_train_episodes: null
   pre_image_norm: False
-  # Drop the seventh, constant gripper channel from observations and actions.
   controlled_dims: 6
 
 norm_dataset: *dataset
