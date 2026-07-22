@@ -14,6 +14,10 @@
 #   IMAGE_SIZE=84            Zarr 中图像的方形边长
 #   BATCH_SIZE=128           2D ResNet 训练 batch size
 #   RGB_WEIGHTS=r3m          r3m / IMAGENET1K_V1 / null
+#   ACTION_STEPS=1           每次策略预测的连续绝对动作数
+#   N_OBS_STEPS=3           历史观测帧数
+#   HORIZON=3                轨迹窗口；须等于N_OBS_STEPS+ACTION_STEPS-1
+#   DISTILL_PHASE=null       null / after_dp / after_offline
 set -euo pipefail
 
 alg_name="${1:-rl100}"
@@ -31,6 +35,10 @@ image_size="${IMAGE_SIZE:-84}"
 batch_size="${BATCH_SIZE:-128}"
 # 与仓库现有 2D 训练脚本保持一致，默认使用机器人操作视频预训练的 R3M。
 rgb_weights="${RGB_WEIGHTS:-r3m}"
+action_steps="${ACTION_STEPS:-1}"
+horizon="${HORIZON:-3}"
+n_obs_steps="${N_OBS_STEPS:-3}"
+distill_phase="${DISTILL_PHASE:-null}"
 
 case "${offline}" in
   True|False) ;;
@@ -48,6 +56,23 @@ if ! [[ "${batch_size}" =~ ^[0-9]+$ ]] || [ "${batch_size}" -le 0 ]; then
   echo "BATCH_SIZE 必须为正整数，当前为: ${batch_size}" >&2
   exit 2
 fi
+if ! [[ "${action_steps}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ACTION_STEPS必须是正整数，当前为: ${action_steps}" >&2
+  exit 2
+fi
+if ! [[ "${n_obs_steps}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "N_OBS_STEPS必须是正整数，当前为: ${n_obs_steps}" >&2
+  exit 2
+fi
+expected_horizon=$((action_steps + n_obs_steps - 1))
+if ! [[ "${horizon}" =~ ^[1-9][0-9]*$ ]] || [ "${horizon}" -ne "${expected_horizon}" ]; then
+  echo "当前N_OBS_STEPS=${n_obs_steps}时，HORIZON必须等于N_OBS_STEPS+ACTION_STEPS-1=${expected_horizon}，当前为: ${horizon}/${action_steps}" >&2
+  exit 2
+fi
+case "${distill_phase}" in
+  null|after_dp|after_offline) ;;
+  *) echo "DISTILL_PHASE必须为null、after_dp或after_offline，当前为: ${distill_phase}" >&2; exit 2 ;;
+esac
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../../.." && pwd)"
@@ -120,6 +145,7 @@ echo "[Piper 2D] output=${run_dir} offline=${offline} resume=${resume}"
 echo "[Piper 2D] image=${image_size}x${image_size} batch_size=${batch_size}"
 echo "[Piper 2D] RGB weights=${rgb_weights}"
 echo "[Piper 2D] dataset=${dataset_path}"
+echo "[Piper 2D] horizon=${horizon} action_steps=${action_steps} distill_phase=${distill_phase}"
 
 # 固定单次配置，不包含学习率、rollout length 或其他超参数循环。
 python train.py --config-name=rl100_2d_epsilon.yaml \
@@ -133,9 +159,10 @@ python train.py --config-name=rl100_2d_epsilon.yaml \
   use_wandb=True \
   checkpoint.save_ckpt=True \
   training.resume="${resume}" \
+  distill_phase="${distill_phase}" \
   +run_validation=True \
   env_num=1 \
-  horizon=3 n_obs_steps=3 n_action_steps=1 \
+  horizon="${horizon}" n_obs_steps="${n_obs_steps}" n_action_steps="${action_steps}" \
   chunk_as_single_action=True \
   dynamics.prediction_mode=full \
   only_bc=True \
