@@ -1,4 +1,5 @@
 import cv2
+import gc
 import time
 import numpy as np
 try:
@@ -103,29 +104,94 @@ class RealSense(object):
         self.depth_height = depth_height
         self.color_width = color_width
         self.color_height = color_height
+        self.fps = fps
         self.num_points = num_points
         self.point_cloud_frame = point_cloud_frame
         # 旧 contact 推理默认使用对齐后的深度；ROS bag pick-and-place
         # 转换使用 /depth/image_rect_raw，因此新推理可显式关闭对齐以匹配训练。
         self.align_depth_to_color = bool(align_depth_to_color)
 
+        self.pipeline = None
+        self.config = None
+        self._started = False
+        self.device_serial = None
+        # Some D435 units expose only YUYV for color (often on USB2). Start
+        # with BGR8 and fall back to YUYV with software conversion if needed.
+        self.color_format = rs.format.bgr8
+        self.align = rs.align(rs.stream.color)
+
+    def _new_pipeline(self):
+        """Create a fresh pipeline/config pair for one start attempt."""
+
         self.pipeline = rs.pipeline()
         self.config = rs.config()
-        self.config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, fps)
-        self.config.enable_stream(rs.stream.color, color_width, color_height, rs.format.bgr8, fps)
-        self.align = rs.align(rs.stream.color)
+        if self.device_serial is None:
+            context = rs.context()
+            devices = list(context.query_devices())
+            if len(devices) == 1:
+                self.device_serial = devices[0].get_info(rs.camera_info.serial_number)
+                print(
+                    f"[realsense] selected device: "
+                    f"{devices[0].get_info(rs.camera_info.name)} "
+                    f"serial={self.device_serial}",
+                    flush=True,
+                )
+            del devices, context
+        if self.device_serial:
+            self.config.enable_device(self.device_serial)
+        self.config.enable_stream(
+            rs.stream.depth,
+            self.depth_width,
+            self.depth_height,
+            rs.format.z16,
+            self.fps,
+        )
+        self.config.enable_stream(
+            rs.stream.color,
+            self.color_width,
+            self.color_height,
+            self.color_format,
+            self.fps,
+        )
 
     def start(self):
         last_error = None
         profile = None
         for attempt in range(5):
+            # A failed librealsense profile resolution can retain a UVC handle.
+            # Reusing that pipeline makes all following attempts fail with the
+            # misleading "UVC device is already opened" message.
+            self.pipeline = None
+            self.config = None
+            gc.collect()
+            self._new_pipeline()
             try:
                 print(f"[realsense] pipeline.start attempt {attempt + 1}/5", flush=True)
                 profile = self.pipeline.start(self.config)
+                self._started = True
                 break
             except RuntimeError as e:
                 last_error = e
                 print(f"[realsense] pipeline.start failed: {e}", flush=True)
+                error_text = str(e).upper()
+                if (
+                    self.color_format == rs.format.bgr8
+                    and "BGR8" in error_text
+                    and "YUYV" in error_text
+                ):
+                    self.color_format = rs.format.yuyv
+                    print(
+                        "[realsense] BGR8 profile unavailable; retrying with YUYV "
+                        "and software BGR conversion",
+                        flush=True,
+                    )
+                try:
+                    self.pipeline.stop()
+                except RuntimeError:
+                    pass
+                self.pipeline = None
+                self.config = None
+                gc.collect()
                 time.sleep(0.5)
         if profile is None:
             raise RuntimeError(f"failed to start RealSense pipeline after retries: {last_error}")
@@ -156,7 +222,9 @@ class RealSense(object):
         self.color_intrinsics = (color_intrinsics.fx, color_intrinsics.fy, color_intrinsics.ppx, color_intrinsics.ppy)
 
     def stop(self):
-        self.pipeline.stop()
+        if self.pipeline is not None and self._started:
+            self.pipeline.stop()
+        self._started = False
 
     def get_frame(self, require_pc=False):
         frames = None
@@ -184,6 +252,14 @@ class RealSense(object):
 
         depth_image = np.array(depth_frame.get_data())
         color_image = np.array(color_frame.get_data())
+        if self.color_format == rs.format.yuyv:
+            # pyrealsense2 normally exposes YUYV as HxWx2; support the packed
+            # Hx(2W) representation from older bindings as well.
+            if color_image.ndim == 2 and color_image.shape[1] == 2 * self.color_width:
+                color_image = color_image.reshape(self.color_height, self.color_width, 2)
+            if color_image.ndim != 3 or color_image.shape[2] != 2:
+                raise RuntimeError(f"YUYV 彩色帧形状异常: {color_image.shape}")
+            color_image = cv2.cvtColor(color_image, cv2.COLOR_YUV2BGR_YUY2)
 
         if require_pc:
             # Piper raw->zarr conversion calls depth2pc(depth, intrinsics)
@@ -212,6 +288,7 @@ class RealSense(object):
             'depth_intrinsics': self.depth_intrinsics,
             'color_intrinsics': self.color_intrinsics,
             'depth_aligned_to_color': self.align_depth_to_color,
+            'color_format': 'YUYV' if self.color_format == rs.format.yuyv else 'BGR8',
         }
 
 

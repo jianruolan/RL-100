@@ -43,10 +43,9 @@ for import_path in (REPO_ROOT, TRAIN_ROOT):
 
 from tools.teleop_off2off_data import infer_piper_contact_policy as contact
 
-# contact 脚本为部分旧环境注入了纯 Python fallback 路径，但当前 rl100_test
-# 已安装带 _C 扩展的 PyTorch3D。新脚本移除 fallback，保持与训练进程一致。
-while str(PYTORCH3D_ROOT) in sys.path:
-    sys.path.remove(str(PYTORCH3D_ROOT))
+# RL1003D 依赖这个仓库内的 ARM64 PyTorch3D 简化实现。contact 模块导入时
+# 已将 PYTORCH3D_ROOT 加入 sys.path，这里不能再删除，否则 Hydra
+# 实例化 rl_100.policy.rl100_3d 时会报 ModuleNotFoundError: pytorch3d。
 
 
 DEFAULT_OUTPUT_DIR = TRAIN_ROOT / "data/outputs/piper_pick_and_place_chunk4_bc_cm_offline_seed42"
@@ -212,13 +211,31 @@ def training_stats(dataset) -> dict[str, np.ndarray]:
     }
 
 
+def point_cloud_outlier_fraction(
+    point_cloud: np.ndarray,
+    stats: dict[str, np.ndarray],
+) -> float:
+    """计算实时点云超出训练分位范围的比例，但不执行停止策略。"""
+
+    outside = np.any(
+        (point_cloud < stats["pc_low"][None])
+        | (point_cloud > stats["pc_high"][None]),
+        axis=1,
+    )
+    return float(outside.mean())
+
+
 def safe_action(predicted: np.ndarray, current: np.ndarray, stats: dict[str, np.ndarray], args) -> tuple[np.ndarray, list[str]]:
     warnings: list[str] = []
     # 关节限位复用 contact 脚本的物理限位和训练分布 margin。
     lower = np.maximum(contact.PIPER_HARD_LOWER_RAD, stats["action_min"][:6] - args.dataset_margin_rad)
     upper = np.minimum(contact.PIPER_HARD_UPPER_RAD, stats["action_max"][:6] + args.dataset_margin_rad)
-    if np.any(current[:6] < lower) or np.any(current[:6] > upper):
+    if not args.skip_current_joint_range_check and (
+        np.any(current[:6] < lower) or np.any(current[:6] > upper)
+    ):
         raise RuntimeError("当前关节姿态超出训练分布安全范围，请先人工移动到示教初始姿态")
+    if args.skip_current_joint_range_check:
+        warnings.append("已跳过当前关节训练范围检查")
     target = predicted.copy()
     if np.any(target[:6] < lower) or np.any(target[:6] > upper):
         if not args.clip_actions:
@@ -233,21 +250,24 @@ def safe_action(predicted: np.ndarray, current: np.ndarray, stats: dict[str, np.
         target[:6] = current[:6] + np.clip(delta_j, -max_joint_step, max_joint_step)
         warnings.append("关节目标被速度限制器裁剪")
 
-    grip_lower = max(GRIPPER_LOWER_M, float(stats["action_min"][6]) - args.gripper_margin_m)
-    grip_upper = min(GRIPPER_UPPER_M, float(stats["action_max"][6]) + args.gripper_margin_m)
-    if not grip_lower <= current[6] <= grip_upper:
-        raise RuntimeError(f"当前夹爪宽度 {current[6]:.4f}m 超出训练分布 [{grip_lower:.4f},{grip_upper:.4f}]m")
-    if target[6] < grip_lower or target[6] > grip_upper:
-        if not args.clip_actions:
-            raise RuntimeError("策略夹爪目标超出训练范围，已停止；可显式传 --clip-actions")
-        target[6] = np.clip(target[6], grip_lower, grip_upper)
-        warnings.append("夹爪目标被裁剪到训练范围")
-    max_grip_step = args.max_gripper_speed_m_s / args.rate
-    if abs(float(target[6] - current[6])) > max_grip_step:
-        if not args.clip_actions:
-            raise RuntimeError("策略夹爪单周期变化超过速度限制，已停止")
-        target[6] = current[6] + np.clip(target[6] - current[6], -max_grip_step, max_grip_step)
-        warnings.append("夹爪目标被速度限制器裁剪")
+    if args.skip_gripper_safety_check:
+        warnings.append("已跳过夹爪范围和速度检查")
+    else:
+        grip_lower = max(GRIPPER_LOWER_M, float(stats["action_min"][6]) - args.gripper_margin_m)
+        grip_upper = min(GRIPPER_UPPER_M, float(stats["action_max"][6]) + args.gripper_margin_m)
+        if not grip_lower <= current[6] <= grip_upper:
+            raise RuntimeError(f"当前夹爪宽度 {current[6]:.4f}m 超出训练分布 [{grip_lower:.4f},{grip_upper:.4f}]m")
+        if target[6] < grip_lower or target[6] > grip_upper:
+            if not args.clip_actions:
+                raise RuntimeError("策略夹爪目标超出训练范围，已停止；可显式传 --clip-actions")
+            target[6] = np.clip(target[6], grip_lower, grip_upper)
+            warnings.append("夹爪目标被裁剪到训练范围")
+        max_grip_step = args.max_gripper_speed_m_s / args.rate
+        if abs(float(target[6] - current[6])) > max_grip_step:
+            if not args.clip_actions:
+                raise RuntimeError("策略夹爪单周期变化超过速度限制，已停止")
+            target[6] = current[6] + np.clip(target[6] - current[6], -max_grip_step, max_grip_step)
+            warnings.append("夹爪目标被速度限制器裁剪")
     return target.astype(np.float32), warnings
 
 
@@ -259,27 +279,50 @@ def send_action(piper: Any, action: np.ndarray, speed_percent: int) -> None:
     piper.GripperCtrl(gripper_raw, GRIPPER_EFFORT, 0x01, 0)
 
 
-def enable_gripper(piper: Any, hold_width_m: float) -> None:
-    """清错并在当前位置使能；绝不发送 0m 导致夹爪意外闭合。"""
+def enable_gripper(
+    piper: Any,
+    reader: PiperPickPlaceStateReader,
+    hold_width_m: float,
+    require_homing: bool,
+    timeout: float = 3.0,
+) -> None:
+    """Enable and hold the gripper, retrying SDK 0x01 until feedback confirms."""
+
     hold_raw = int(round(float(hold_width_m) * GRIPPER_RAW_PER_M))
-    # 不设置零点，避免改变训练/反馈坐标。
-    piper.GripperCtrl(hold_raw, GRIPPER_EFFORT, 0x02, 0)
-    time.sleep(0.05)
-    piper.GripperCtrl(hold_raw, GRIPPER_EFFORT, 0x01, 0)
-    time.sleep(0.05)
+    # 先读取真实反馈。已使能时绝不发 0x02，因为 Piper SDK 明确
+    # 定义 0x02 为“失能清错”，会导致第二次推理启动时先把夹爪关掉。
+    reader.read()
+    status = reader.last_gripper_status
+    if status.get("driver_enable_status") and (
+        status.get("homing_status") or not require_homing
+    ):
+        piper.GripperCtrl(hold_raw, GRIPPER_EFFORT, 0x01, 0)
+        print("[Piper] 夹爪已使能，保持当前宽度", flush=True)
+        return
 
+    # 仅在驱动未使能时清错一次，之后像 SDK piper_ctrl_gripper
+    # demo 一样持续发送 0x01 使能/位置指令，而不是只发一帧。
+    if not status.get("driver_enable_status"):
+        piper.GripperCtrl(hold_raw, GRIPPER_EFFORT, 0x02, 0)
+        time.sleep(0.1)
 
-def wait_gripper_ready(reader: PiperPickPlaceStateReader, timeout: float = 2.0) -> None:
-    """等待 0x2A8 反馈确认夹爪已使能且已建立零点。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        piper.GripperCtrl(hold_raw, GRIPPER_EFFORT, 0x01, 0)
+        time.sleep(0.02)
         reader.read()
         status = reader.last_gripper_status
-        if status.get("driver_enable_status") and status.get("homing_status"):
+        if status.get("driver_enable_status") and (
+            status.get("homing_status") or not require_homing
+        ):
+            print(
+                f"[Piper] 夹爪使能成功: enable=True, "
+                f"homing={status.get('homing_status')}",
+                flush=True,
+            )
             return
-        time.sleep(0.02)
     raise RuntimeError(
-        "夹爪使能/回零状态未就绪；请先按 Piper 流程完成夹爪回零并检查驱动器，"
+        "夹爪使能状态未就绪；请先按 Piper 流程检查驱动器，"
         f"当前状态={reader.last_gripper_status}"
     )
 
@@ -305,16 +348,40 @@ def parse_args():
     p.add_argument("--rate", type=float, default=13.0)
     p.add_argument("--camera-fps", type=int, default=15)
     p.add_argument("--max-steps", type=int, default=200)
+    p.add_argument(
+        "--chunk-exec-steps",
+        type=int,
+        default=1,
+        help=(
+            "每次策略推理后依次执行的 action chunk 步数，范围 [1,4]。"
+            "--rate 仍表示动作下发频率；默认 1 为逐步重新规划。"
+        ),
+    )
     p.add_argument("--execute", action="store_true")
     p.add_argument("--clip-actions", action="store_true")
+    p.add_argument(
+        "--skip-current-joint-range-check",
+        action="store_true",
+        help="允许当前关节姿态在训练范围外启动；仍保留策略目标和速度安全限制。",
+    )
     p.add_argument("--dataset-margin-rad", type=float, default=0.03)
     p.add_argument("--gripper-margin-m", type=float, default=0.005)
     p.add_argument("--max-joint-speed-rad-s", type=float, default=0.15)
     p.add_argument("--max-gripper-speed-m-s", type=float, default=0.02)
+    p.add_argument(
+        "--skip-gripper-safety-check",
+        action="store_true",
+        help="跳过夹爪训练范围、当前宽度和速度检查；关节安全限制仍保留。",
+    )
     p.add_argument("--speed-percent", type=int, default=10)
     p.add_argument("--reuse-diffusion-noise", action="store_true")
     p.add_argument("--diffusion-noise-seed", type=int, default=42)
     p.add_argument("--max-point-outlier-fraction", type=float, default=0.25)
+    p.add_argument(
+        "--skip-point-cloud-distribution-check",
+        action="store_true",
+        help="点云超出训练分布时仅记录 pc_out，不停止推理。",
+    )
     p.add_argument("--state-stale-seconds", type=float, default=0.5)
     p.add_argument("--enable-timeout", type=float, default=5.0)
     p.add_argument(
@@ -331,6 +398,8 @@ def main():
         raise ValueError("--rate 必须在 (0,20] Hz")
     if args.camera_fps < args.rate or args.max_steps <= 0:
         raise ValueError("camera-fps 必须不低于 rate，max-steps 必须为正")
+    if not 1 <= args.chunk_exec_steps <= 4:
+        raise ValueError("--chunk-exec-steps 必须在 [1,4] 内")
     if not 1 <= args.speed_percent <= 100:
         raise ValueError("--speed-percent 必须在 [1,100]")
     if args.rate > 15:
@@ -346,26 +415,45 @@ def main():
     if int(cfg.n_obs_steps) != 3 or int(cfg.n_action_steps) != 4 or int(cfg.horizon) != 6:
         raise RuntimeError(f"训练 chunk 必须是 n_obs_steps=3,n_action_steps=4,horizon=6，当前为 {cfg.n_obs_steps}/{cfg.n_action_steps}/{cfg.horizon}")
     device = torch.device(args.device)
-    stats = training_stats(dataset)
-    print("[训练范围] state:", stats["state_min"], stats["state_max"], flush=True)
-    print("[训练范围] action:", stats["action_min"], stats["action_max"], flush=True)
     if args.offline_smoke:
         offline_smoke(dataset, policy, device, use_cm, expected_steps=4)
         return
 
     from tools.teleop_off2off_data.realsense import RealSense
-    C_PiperInterface_V2 = contact.import_piper_sdk(args.piper_sdk_root)
-    piper = C_PiperInterface_V2(args.can)
-    piper.ConnectPort()
-    reader = PiperPickPlaceStateReader(piper)
+
+    # RealSense 必须在读取整套训练统计和启动 Piper CAN 后台线程之前
+    # 打开。当前 ARM 主机上，training_stats() 之后再解析 UVC profile
+    # 会稳定失败；这个顺序已用完整 BC 模型、D435i 和 can_right 验证。
     camera = RealSense(fps=args.camera_fps, color_width=640, color_height=480,
                        depth_width=640, depth_height=480, num_points=512,
                        point_cloud_frame="camera", align_depth_to_color=False)
     camera.start()
+    try:
+        stats = training_stats(dataset)
+        print("[训练范围] state:", stats["state_min"], stats["state_max"], flush=True)
+        print("[训练范围] action:", stats["action_min"], stats["action_max"], flush=True)
+        C_PiperInterface_V2 = contact.import_piper_sdk(args.piper_sdk_root)
+        piper = C_PiperInterface_V2(args.can)
+        piper.ConnectPort()
+        reader = PiperPickPlaceStateReader(piper)
+    except Exception:
+        camera.stop()
+        raise
     print("[相机] RGB=RGB8预处理，Depth=未对齐原始深度，点云坐标=d435i_depth_optical_frame", flush=True)
     print("[模式]", "真机执行" if args.execute else "影子模式（不下发）", flush=True)
-    print(f"[动作] 训练 chunk=4，每 {args.rate:g}Hz 重新推理并执行 chunk[0]（receding horizon）", flush=True)
+    print(
+        f"[动作] 训练 chunk=4，每次推理依次执行前 {args.chunk_exec_steps} 步；"
+        f"动作下发 {args.rate:g}Hz，模型重规划约 "
+        f"{args.rate / args.chunk_exec_steps:g}Hz",
+        flush=True,
+    )
     print("[人工] 输入 stop/Enter 停止并保持；输入 estop 发送 SDK 硬急停。", flush=True)
+    if args.skip_current_joint_range_check:
+        print("[安全警告] 已跳过当前关节训练范围检查，仅用于零点/人工初始姿态测试", flush=True)
+    if args.skip_gripper_safety_check:
+        print("[安全警告] 已跳过夹爪范围和速度检查，请确认夹爪机械限位与急停可用", flush=True)
+    if args.skip_point_cloud_distribution_check:
+        print("[安全警告] 已跳过点云分布停止检查，pc_out 仍会记录到终端和日志", flush=True)
 
     history = deque(maxlen=3)
     records = []
@@ -393,11 +481,19 @@ def main():
             if phrase != "EXECUTE PIPER":
                 raise RuntimeError("确认短语不匹配，取消执行")
             contact.enable_robot_for_position_control(piper, args.speed_percent, args.enable_timeout)
-            enable_gripper(piper, float(last_state[6]))
-            wait_gripper_ready(reader)
+            # 此时关节已使能；即使后续夹爪恢复失败，finally 也必须
+            # 执行关节保持，不能因 robot_enabled 设置太晚而跳过。
             robot_enabled = True
+            enable_gripper(
+                piper,
+                reader,
+                float(last_state[6]),
+                require_homing=not args.skip_gripper_safety_check,
+            )
         operator.start()
         next_deadline = time.monotonic()
+        active_chunk: np.ndarray | None = None
+        inference_index = -1
         for step in range(args.max_steps):
             command = operator.poll()
             if command in {"estop", "e", "emergency"}:
@@ -422,19 +518,52 @@ def main():
             last_joint_ts, last_grip_ts = joint_ts, grip_ts
             frame = camera.get_frame(require_pc=False)
             image, pc = preprocess_camera_frame(frame)
-            fraction = contact.validate_point_cloud_distribution(
-                pc, contact.TrainingStats(stats["state_min"][:6], stats["state_max"][:6], stats["action_min"][:6], stats["action_max"][:6], stats["action_delta_p99"][:6], stats["pc_low"], stats["pc_high"]), args.max_point_outlier_fraction
-            )
+            if args.skip_point_cloud_distribution_check:
+                fraction = point_cloud_outlier_fraction(pc, stats)
+            else:
+                fraction = contact.validate_point_cloud_distribution(
+                    pc, contact.TrainingStats(stats["state_min"][:6], stats["state_max"][:6], stats["action_min"][:6], stats["action_max"][:6], stats["action_delta_p99"][:6], stats["pc_low"], stats["pc_high"]), args.max_point_outlier_fraction
+                )
             history.append({"agent_pos": state, "point_cloud": pc, "image": image})
-            with torch.no_grad():
-                output = policy.predict_action(build_obs(history, device), deterministic=True, use_cm=use_cm, initial_noise=episode_noise)
-            chunk = extract_action_chunk(output, expected_steps=4)
-            target, warnings = safe_action(chunk[0], state, stats, args)
+            chunk_step = step % args.chunk_exec_steps
+            ran_inference = chunk_step == 0 or active_chunk is None
+            if ran_inference:
+                with torch.no_grad():
+                    output = policy.predict_action(
+                        build_obs(history, device),
+                        deterministic=True,
+                        use_cm=use_cm,
+                        initial_noise=episode_noise,
+                    )
+                active_chunk = extract_action_chunk(output, expected_steps=4)
+                inference_index += 1
+                chunk_step = 0
+            predicted_action = active_chunk[chunk_step]
+            target, warnings = safe_action(predicted_action, state, stats, args)
             if robot_enabled:
                 send_action(piper, target, args.speed_percent)
-            record = {"step": step, "host_time": time.time(), "joint_gripper_state": state.tolist(), "predicted_chunk": chunk.tolist(), "safe_action": target.tolist(), "point_outlier_fraction": fraction, "warnings": warnings, "executed": robot_enabled}
+            record = {
+                "step": step,
+                "host_time": time.time(),
+                "joint_gripper_state": state.tolist(),
+                "predicted_chunk": active_chunk.tolist(),
+                "chunk_step": chunk_step,
+                "policy_inference": ran_inference,
+                "inference_index": inference_index,
+                "safe_action": target.tolist(),
+                "point_outlier_fraction": fraction,
+                "warnings": warnings,
+                "executed": robot_enabled,
+            }
             records.append(record)
-            print(f"[step {step:04d}] state={np.round(state,4)} chunk0={np.round(chunk[0],4)} target={np.round(target,4)} pc_out={fraction:.1%} {'EXEC' if robot_enabled else 'SHADOW'}", flush=True)
+            print(
+                f"[step {step:04d}] state={np.round(state,4)} "
+                f"chunk{chunk_step}={np.round(predicted_action,4)} "
+                f"target={np.round(target,4)} pc_out={fraction:.1%} "
+                f"{'INFER' if ran_inference else 'CACHED'} "
+                f"{'EXEC' if robot_enabled else 'SHADOW'}",
+                flush=True,
+            )
             for warning in warnings:
                 print(f"[安全警告] {warning}", flush=True)
             last_state = state.copy()
@@ -466,7 +595,7 @@ def main():
         if not log_path.is_absolute():
             log_path = REPO_ROOT / log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "n_obs_steps": 3, "horizon": 6, "n_action_steps": 4, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "n_obs_steps": 3, "horizon": 6, "n_action_steps": 4, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[日志] 已保存: {log_path.resolve()}", flush=True)
 
 
