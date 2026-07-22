@@ -1,0 +1,50 @@
+name: piper_pick_and_place
+
+task_name: piper_pick_and_place
+
+# Piper pick-and-place ROS bag 转换后的数据格式：
+#   state:  六个关节反馈(rad) + 夹爪总开口宽度(m)
+#   action: 六个实际下发关节目标(rad) + 夹爪 position(m)
+#   image:  3x84x84 RGB，point_cloud: 512x3（深度相机 optical frame）
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: [3, 84, 84]
+      type: rgb
+    point_cloud:
+      shape: [512, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [7]
+
+# 当前只训练离线数据。部署真机前需要单独实现带有复位、夹爪限制、
+# 关节速度限制和急停逻辑的 Piper runner。
+env_runner: null
+
+dataset: &dataset
+  _target_: rl_100.dataset.adroit_dataset.AdroitDataset
+  zarr_path: data/piper_pick_and_place.zarr
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: ${training.seed}
+  # 当前有 24 条成功轨迹，固定划分约 3 条完整轨迹用于 validation。
+  val_ratio: 0.125
+  max_train_episodes: null
+  pre_image_norm: False
+  # 六个机械臂关节和夹爪宽度全部参与归一化、训练与动作输出。
+  controlled_dims: 7
+
+norm_dataset: *dataset
+
+critic_dataset:
+  <<: *dataset
+  val_ratio: 0.0
+
+scale_dataset:
+  <<: *dataset
+  val_ratio: 0.0
+  scale_strategy: dynamic

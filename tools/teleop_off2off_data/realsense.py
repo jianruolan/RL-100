@@ -96,6 +96,7 @@ class RealSense(object):
         color_height=480,
         num_points=1024,
         point_cloud_frame="root",
+        align_depth_to_color=True,
     ):
         point_cloud_pose(point_cloud_frame)
         self.depth_width = depth_width
@@ -104,6 +105,9 @@ class RealSense(object):
         self.color_height = color_height
         self.num_points = num_points
         self.point_cloud_frame = point_cloud_frame
+        # 旧 contact 推理默认使用对齐后的深度；ROS bag pick-and-place
+        # 转换使用 /depth/image_rect_raw，因此新推理可显式关闭对齐以匹配训练。
+        self.align_depth_to_color = bool(align_depth_to_color)
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
@@ -158,7 +162,12 @@ class RealSense(object):
         frames = None
         for i in range(20):
             try:
-                frames = self.align.process(self.pipeline.wait_for_frames(5000))
+                raw_frames = self.pipeline.wait_for_frames(5000)
+                frames = (
+                    self.align.process(raw_frames)
+                    if self.align_depth_to_color
+                    else raw_frames
+                )
             except RuntimeError as e:
                 print(f"[realsense] capture wait_for_frames failed {i + 1}/20: {e}", flush=True)
                 time.sleep(0.1)
@@ -200,6 +209,9 @@ class RealSense(object):
             'depth_scale': self.depth_scale,
             'point_cloud': point_cloud,
             'point_cloud_frame': self.point_cloud_frame,
+            'depth_intrinsics': self.depth_intrinsics,
+            'color_intrinsics': self.color_intrinsics,
+            'depth_aligned_to_color': self.align_depth_to_color,
         }
 
 
