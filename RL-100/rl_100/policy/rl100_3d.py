@@ -455,6 +455,7 @@ class RL1003D(BasePolicy):
             condition_data_pc=None, condition_mask_pc=None,
             local_cond=None, global_cond=None,
             generator=None,
+            initial_noise=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -477,10 +478,24 @@ class RL1003D(BasePolicy):
             scheduler = self.ddim_scheduler
             num_inference_steps = self.ddim_inference_steps
 
-        trajectory = torch.randn(
-            size=condition_data.shape,
-            dtype=condition_data.dtype,
-            device=condition_data.device)
+        if initial_noise is None:
+            trajectory = torch.randn(
+                size=condition_data.shape,
+                dtype=condition_data.dtype,
+                device=condition_data.device,
+                generator=generator)
+        else:
+            if tuple(initial_noise.shape) != tuple(condition_data.shape):
+                raise ValueError(
+                    "initial_noise shape must match condition_data: "
+                    f"{tuple(initial_noise.shape)} != {tuple(condition_data.shape)}"
+                )
+            trajectory = initial_noise.to(
+                device=condition_data.device,
+                dtype=condition_data.dtype,
+            ).clone()
+            if not torch.isfinite(trajectory).all():
+                raise ValueError("initial_noise contains NaN or Inf")
 
         # set step values
         scheduler.set_timesteps(num_inference_steps)
@@ -637,7 +652,7 @@ class RL1003D(BasePolicy):
         return cond_data, cond_mask, local_cond, global_cond, nobs_features.reshape(B, -1)
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor], deterministic: bool = False, distill2mean: bool = False, use_cm: bool = False) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], deterministic: bool = False, distill2mean: bool = False, use_cm: bool = False, initial_noise=None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
@@ -702,6 +717,7 @@ class RL1003D(BasePolicy):
             deterministic=deterministic,
             use_cm=use_cm,
             distill2mean=distill2mean,
+            initial_noise=initial_noise,
             **self.kwargs) # (batch_size, horizon, act_dim)
         
         # unnormalize prediction

@@ -2790,8 +2790,11 @@ class TrainDP3Workspace:
                             self.save_checkpoint(path=topk_ckpt_path)
                         if cfg.only_bc:
                             self.unio4.set_policy(self.model); self.unio4.set_old_policy()
-                            os.makedirs(os.path.join(self.output_dir, 'best_cm'), exist_ok=True)
-                            self.unio4.save(os.path.join(self.output_dir, 'best_cm'))
+                            best_cm_path = os.path.join(self.output_dir, 'best_cm')
+                            os.makedirs(best_cm_path, exist_ok=True)
+                            # PPO.save() 只保存 policy.model（teacher），会遗漏
+                            # distilled_model；CM 检查点必须由 RL100 policy 保存。
+                            model_to_optimize.save(best_cm_path)
                     os.makedirs(os.path.join(self.offline_best_path, '_{}'.format(str(self.epoch))), exist_ok=True)
                     model_to_optimize.save(os.path.join(os.path.join(self.offline_best_path, '_{}'.format(str(self.epoch)))))
                     os.makedirs(os.path.join(self.offline_best_path, 'last'), exist_ok=True)

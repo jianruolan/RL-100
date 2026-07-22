@@ -212,6 +212,7 @@ def load_policy_and_dataset(
 
     config_path = output_dir / ".hydra/config.yaml"
     policy_dir = output_dir / policy_subdir
+    use_cm = policy_subdir == "best_cm"
     if not config_path.exists():
         raise FileNotFoundError(f"找不到训练配置: {config_path}")
     for filename in ("model.pt", "encoder.pt"):
@@ -245,20 +246,44 @@ def load_policy_and_dataset(
         os.chdir(old_cwd)
 
     policy.set_normalizer(normalizer)
+    if use_cm and not hasattr(policy, "distilled_model"):
+        policy.set_target()
     policy.load(str(policy_dir))
+    cm_weight_path: Path | None = None
+    if use_cm:
+        # 新版本训练结果应直接在 best_cm 下保存 distilled_model.pt。兼容当前
+        # 旧结果：旧 PPO save() 只保存了 teacher model.pt，真正的 CM student
+        # 位于同一次训练的 best/last/distilled_model.pt。
+        cm_candidates = [
+            policy_dir / "distilled_model.pt",
+            output_dir / "best" / "last" / "distilled_model.pt",
+        ]
+        cm_weight_path = next((path for path in cm_candidates if path.exists()), None)
+        if cm_weight_path is None:
+            candidates_text = "\n".join(str(path) for path in cm_candidates)
+            raise FileNotFoundError(
+                "选择 best_cm 但找不到一致性蒸馏 student 权重。检查以下路径：\n"
+                f"{candidates_text}"
+            )
+        distilled_model = getattr(policy, "distilled_model", None)
+        if distilled_model is None:
+            raise RuntimeError("当前策略未创建 distilled_model，不能执行 CM 推理")
+        distilled_model.load_state_dict(torch.load(cm_weight_path, map_location="cpu"))
     policy.to(torch.device(device))
     policy.eval()
 
     dataset_path = resolve_training_path(cfg.task.dataset.zarr_path)
     print(f"[模型] 配置: {config_path}", flush=True)
     print(f"[模型] 权重: {policy_dir}", flush=True)
+    if cm_weight_path is not None:
+        print(f"[模型] CM student 权重: {cm_weight_path}", flush=True)
     print(f"[模型] normalizer 数据集: {dataset_path}", flush=True)
     print(
         f"[模型] n_obs_steps={cfg.n_obs_steps}, "
         f"n_action_steps={cfg.n_action_steps}, action_dim={cfg.shape_meta.action.shape[0]}",
         flush=True,
     )
-    return cfg, dataset, policy
+    return cfg, dataset, policy, use_cm
 
 
 def compute_training_stats(dataset) -> TrainingStats:
@@ -342,6 +367,51 @@ def extract_first_action(action_dict: dict[str, torch.Tensor]) -> np.ndarray:
     if not np.all(np.isfinite(target)):
         raise RuntimeError(f"策略输出包含 NaN/Inf: {target}")
     return target
+
+
+def exponential_smooth_joint_target(
+    predicted: np.ndarray,
+    previous_target: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """对绝对关节目标做一阶 EMA；alpha 越小，平滑越强、滞后越大。"""
+
+    predicted = np.asarray(predicted, dtype=np.float32)
+    previous_target = np.asarray(previous_target, dtype=np.float32)
+    if predicted.shape != (6,) or previous_target.shape != (6,):
+        raise ValueError(
+            "动作平滑要求 predicted/previous_target 均为六关节向量，"
+            f"实际为 {predicted.shape}/{previous_target.shape}"
+        )
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"动作平滑 alpha 必须在 (0,1]，实际为 {alpha}")
+    target = alpha * predicted + (1.0 - alpha) * previous_target
+    if not np.all(np.isfinite(target)):
+        raise RuntimeError(f"动作平滑结果包含 NaN/Inf: {target}")
+    return target.astype(np.float32)
+
+
+def make_episode_diffusion_noise(
+    policy: Any,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """生成一次并在本次脚本运行（一个 episode）内复用的扩散初始噪声。"""
+
+    horizon = int(policy.horizon)
+    n_obs_steps = int(policy.n_obs_steps)
+    if bool(policy.no_pre_action):
+        horizon -= n_obs_steps - 1
+    if horizon <= 0:
+        raise RuntimeError(f"扩散轨迹 horizon 非法: {horizon}")
+    shape = (1, horizon, int(policy.action_dim))
+
+    # 先在 CPU 用独立 generator 生成，再搬到目标设备；这样不会污染全局
+    # torch RNG，并兼容 CPU/CUDA/MUSA 等不同后端的 Generator 支持差异。
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    noise = torch.randn(shape, generator=generator, dtype=torch.float32)
+    return noise.to(device=device, dtype=policy.dtype)
 
 
 def validate_point_cloud_distribution(
@@ -544,13 +614,13 @@ def save_run_log(log_path: Path, records: list[dict[str, Any]], meta: dict[str, 
     print(f"[日志] 已保存: {log_path}", flush=True)
 
 
-def offline_smoke_test(dataset, policy, device: torch.device) -> None:
+def offline_smoke_test(dataset, policy, device: torch.device, use_cm: bool) -> None:
     """不连接任何硬件，用训练数据验证模型、normalizer 和权重。"""
 
     sample = dataset[0]["obs"]
     obs = {key: value.unsqueeze(0).to(device) for key, value in sample.items()}
     with torch.no_grad():
-        action_dict = policy.predict_action(obs, deterministic=True, use_cm=False)
+        action_dict = policy.predict_action(obs, deterministic=True, use_cm=use_cm)
     action = extract_first_action(action_dict)
     print("[offline-smoke] 推理成功，第一步反归一化 action(rad):", action, flush=True)
 
@@ -560,9 +630,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--policy-subdir",
-        choices=["best", "bc"],
+        choices=["best", "bc", "best_cm"],
         default="best",
-        help="默认部署 offline RL best；首次真机测试建议也用 bc 做对照。",
+        help=(
+            "best=offline RL/DDIM，bc=行为克隆/DDIM，"
+            "best_cm=一致性蒸馏 student/CM。"
+        ),
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--offline-smoke", action="store_true")
@@ -589,6 +662,28 @@ def parse_args() -> argparse.Namespace:
         default=0.15,
         help="第一轮测试的保守关节速度上限；确认安全后再逐步提高。",
     )
+    parser.add_argument(
+        "--action-smoothing",
+        action="store_true",
+        help="启用绝对关节目标的一阶 EMA 时间平滑；默认关闭。",
+    )
+    parser.add_argument(
+        "--action-smoothing-alpha",
+        type=float,
+        default=0.2,
+        help="EMA 新预测权重，范围 (0,1]；越小越平滑但滞后越大，默认 0.2。",
+    )
+    parser.add_argument(
+        "--reuse-diffusion-noise",
+        action="store_true",
+        help="在本次运行的所有推理步复用同一份扩散初始噪声；默认关闭。",
+    )
+    parser.add_argument(
+        "--diffusion-noise-seed",
+        type=int,
+        default=42,
+        help="固定扩散初始噪声的随机种子，默认 42。",
+    )
     parser.add_argument("--max-point-outlier-fraction", type=float, default=0.25)
     parser.add_argument("--state-stale-seconds", type=float, default=0.5)
     parser.add_argument("--enable-timeout", type=float, default=5.0)
@@ -612,8 +707,10 @@ def main() -> None:
         raise ValueError("--max-steps 必须为正整数")
     if not 1 <= args.speed_percent <= 100:
         raise ValueError("--speed-percent 必须在 [1,100]")
+    if not 0.0 < args.action_smoothing_alpha <= 1.0:
+        raise ValueError("--action-smoothing-alpha 必须在 (0,1]")
 
-    cfg, dataset, policy = load_policy_and_dataset(
+    cfg, dataset, policy, use_cm = load_policy_and_dataset(
         args.output_dir,
         args.policy_subdir,
         args.device,
@@ -629,7 +726,7 @@ def main() -> None:
         )
 
     if args.offline_smoke:
-        offline_smoke_test(dataset, policy, device)
+        offline_smoke_test(dataset, policy, device, use_cm)
         return
 
     # 离线 smoke test 不应依赖 RealSense/pyrealsense2；只有连接真机时再导入。
@@ -657,6 +754,29 @@ def main() -> None:
     print("\n[模式]", "真机执行" if args.execute else "影子模式（绝不下发动作）", flush=True)
     print("[人工] Enter/q：停止策略并保持使能；输入 estop：SDK 硬急停（可能失力）。", flush=True)
     print("[安全] 请确保急停可触达、机械臂周围无人、工作空间无障碍物。", flush=True)
+    if args.action_smoothing:
+        print(
+            f"[控制] 动作 EMA 平滑已启用: alpha={args.action_smoothing_alpha:.3f}",
+            flush=True,
+        )
+    else:
+        print("[控制] 动作 EMA 平滑未启用", flush=True)
+
+    episode_diffusion_noise = None
+    if args.reuse_diffusion_noise:
+        episode_diffusion_noise = make_episode_diffusion_noise(
+            policy,
+            device,
+            args.diffusion_noise_seed,
+        )
+        print(
+            "[扩散] 本 episode 复用固定初始噪声: "
+            f"seed={args.diffusion_noise_seed}, "
+            f"shape={tuple(episode_diffusion_noise.shape)}",
+            flush=True,
+        )
+    else:
+        print("[扩散] 每个推理步重新采样初始噪声", flush=True)
 
     robot_enabled_by_script = False
     history: deque[dict[str, np.ndarray]] = deque(maxlen=3)
@@ -689,6 +809,9 @@ def main() -> None:
 
         initial_joint = history[-1]["agent_pos"]
         last_valid_joint = initial_joint.copy()
+        # EMA 以上一次实际安全目标为历史值。第一步从当前姿态开始，避免启用
+        # 平滑后仍突然跳向第一条策略预测。
+        previous_safe_target = initial_joint.copy()
         # 即使在影子模式也检查初始姿态，提前暴露训练/部署范围不一致。
         safe_joint_target(
             initial_joint,
@@ -757,11 +880,19 @@ def main() -> None:
                 action_dict = policy.predict_action(
                     obs,
                     deterministic=True,
-                    use_cm=False,
+                    use_cm=use_cm,
+                    initial_noise=episode_diffusion_noise,
                 )
             predicted = extract_first_action(action_dict)
+            action_before_safety = predicted
+            if args.action_smoothing:
+                action_before_safety = exponential_smooth_joint_target(
+                    predicted,
+                    previous_safe_target,
+                    args.action_smoothing_alpha,
+                )
             target, safety_warnings = safe_joint_target(
-                predicted,
+                action_before_safety,
                 current_joint,
                 stats,
                 args.rate,
@@ -769,6 +900,8 @@ def main() -> None:
                 args.max_joint_speed_rad_s,
                 args.clip_actions,
             )
+            # 下一周期使用实际通过安全过滤的目标，而不是未执行的平滑结果。
+            previous_safe_target = target.copy()
 
             if robot_enabled_by_script:
                 send_joint_target(piper, target, args.speed_percent)
@@ -792,6 +925,7 @@ def main() -> None:
                 "camera_timestamp": float(frame["timestamp"]),
                 "joint_rad": current_joint.tolist(),
                 "predicted_action_rad": predicted.tolist(),
+                "smoothed_action_rad": action_before_safety.tolist(),
                 "safe_target_rad": target.tolist(),
                 "point_outlier_fraction": outlier_fraction,
                 "safety_warnings": safety_warnings,
@@ -806,10 +940,12 @@ def main() -> None:
                 },
             }
             records.append(record)
+            action_text = f"pred={np.round(predicted, 4)} "
+            if args.action_smoothing:
+                action_text += f"smooth={np.round(action_before_safety, 4)} "
             print(
                 f"[step {step:04d}] q={np.round(current_joint, 4)} "
-                f"pred={np.round(predicted, 4)} "
-                f"target={np.round(target, 4)} "
+                f"{action_text}target={np.round(target, 4)} "
                 f"pc_out={outlier_fraction:.1%} "
                 f"mode=0x{arm_status.ctrl_mode:02X} "
                 f"{'EXEC' if robot_enabled_by_script else 'SHADOW'}",
@@ -864,9 +1000,16 @@ def main() -> None:
             {
                 "output_dir": str(args.output_dir),
                 "policy_subdir": args.policy_subdir,
+                "use_cm": use_cm,
                 "rate_hz": args.rate,
                 "execute": args.execute,
                 "max_joint_speed_rad_s": args.max_joint_speed_rad_s,
+                "action_smoothing": args.action_smoothing,
+                "action_smoothing_alpha": args.action_smoothing_alpha,
+                "reuse_diffusion_noise": args.reuse_diffusion_noise,
+                "diffusion_noise_seed": (
+                    args.diffusion_noise_seed if args.reuse_diffusion_noise else None
+                ),
                 "dataset_margin_rad": args.dataset_margin_rad,
                 "point_cloud_frame": "camera",
                 "stop_reason": stop_reason,
