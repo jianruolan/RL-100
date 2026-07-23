@@ -34,15 +34,18 @@ for import_path in (REPO_ROOT, TRAIN_ROOT):
     if str(import_path) not in sys.path:
         sys.path.insert(0, str(import_path))
 
-# 当前aarch64环境已经安装带扩展的PyTorch3D。先加载它，防止旧contact
-# 脚本随后加入未编译_C的源码回退目录并遮蔽可用版本。
-try:
-    import pytorch3d.ops  # noqa: F401
-except ImportError:
-    pass
-
 from tools.teleop_off2off_data import infer_piper_contact_policy as contact
 from tools.teleop_off2off_data import infer_piper_pick_and_place_policy as base
+
+# contact 会把仓库内已编译的 aarch64 PyTorch3D fallback 加入 sys.path。
+# 在加载 Hydra 策略前显式验证，避免缺失依赖被静默忽略后报出难定位的错误。
+try:
+    import pytorch3d.ops  # noqa: F401
+except ImportError as exc:
+    raise ImportError(
+        "无法导入 pytorch3d.ops；请检查 third_party/pytorch3d_simplified/"
+        "pytorch3d/_C.cpython-310-aarch64-linux-gnu.so 是否与当前 Python/架构匹配"
+    ) from exc
 
 
 DEFAULT_OUTPUT_DIR = (
@@ -315,6 +318,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-margin-rad", type=float, default=0.03)
     parser.add_argument("--max-joint-speed-rad-s", type=float, default=0.15)
     parser.add_argument("--speed-percent", type=int, default=10)
+    parser.add_argument(
+        "--skip-gripper-safety-check",
+        action="store_true",
+        help=(
+            "跳过夹爪训练宽度/回零要求；仍执行 SDK 夹爪使能并检查驱动器故障，"
+            "用于已确认夹爪可用但 homing_status 未置位的测试。"
+        ),
+    )
     parser.add_argument("--open-width-m", type=float, default=0.07)
     parser.add_argument("--close-width-m", type=float, default=0.0)
     parser.add_argument("--gripper-effort", type=int, default=base.GRIPPER_EFFORT)
@@ -442,6 +453,12 @@ def main() -> None:
     )
     if args.execute and not args.allow_gripper_events:
         print("[安全] 机械臂可执行，但策略夹爪事件被禁止，夹爪保持初始宽度", flush=True)
+    if args.skip_gripper_safety_check:
+        print(
+            "[安全警告] 已跳过夹爪回零/训练宽度检查；仍要求驱动器使能且无故障，"
+            "请确认机械限位和急停可用",
+            flush=True,
+        )
     print("[人工] Enter/stop保持停止；estop发送SDK快速停止。", flush=True)
 
     history: deque[dict[str, np.ndarray]] = deque(maxlen=n_obs_steps)
@@ -484,7 +501,7 @@ def main() -> None:
 
         if args.execute:
             expected_phrase = (
-                "EXECUTE PIPER WITH GRIPPER"
+                "EXECUTE"
                 if args.allow_gripper_events else "EXECUTE PIPER"
             )
             phrase = input(f"确认工作区安全后输入 {expected_phrase}：").strip()
@@ -498,7 +515,8 @@ def main() -> None:
                 piper,
                 reader,
                 desired_gripper_width,
-                require_homing=True,
+                require_homing=not args.skip_gripper_safety_check,
+                timeout=args.enable_timeout,
             )
         operator.start()
 
