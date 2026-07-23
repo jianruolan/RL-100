@@ -329,6 +329,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--open-width-m", type=float, default=0.07)
     parser.add_argument("--close-width-m", type=float, default=0.0)
     parser.add_argument("--gripper-effort", type=int, default=base.GRIPPER_EFFORT)
+    parser.add_argument(
+        "--initial-gripper-state",
+        choices=["open", "feedback"],
+        default="open",
+        help="pick-and-place示教轨迹默认从open开始；feedback仅用于特殊任务。",
+    )
     parser.add_argument("--initial-open-threshold-m", type=float, default=0.061)
     parser.add_argument("--close-threshold", type=float, default=0.4)
     parser.add_argument("--open-threshold", type=float, default=0.6)
@@ -488,9 +494,15 @@ def main() -> None:
             )
             time.sleep(1.0 / args.rate)
         last_state = history[-1]["agent_pos"].copy()
-        desired_gripper_width = float(last_state[6])
+        initial_open = (
+            args.initial_gripper_state == "open"
+            or float(last_state[6]) >= args.initial_open_threshold_m
+        )
+        desired_gripper_width = (
+            args.open_width_m if initial_open else float(last_state[6])
+        )
         decoder = GripperEventDecoder(
-            initial_open=desired_gripper_width >= args.initial_open_threshold_m,
+            initial_open=initial_open,
             close_threshold=args.close_threshold,
             open_threshold=args.open_threshold,
             consecutive=args.consecutive,
@@ -518,6 +530,26 @@ def main() -> None:
                 require_homing=not args.skip_gripper_safety_check,
                 timeout=args.enable_timeout,
             )
+            if initial_open:
+                # 训练轨迹全部从张开状态开始；先等待夹爪反馈稳定，再建立
+                # n_obs_steps历史，避免用“启动时闭合”的帧污染策略输入。
+                time.sleep(max(0.3, 2.0 / args.rate))
+                history.clear()
+                for _ in range(n_obs_steps):
+                    refreshed_state, _, _ = reader.read()
+                    refreshed_frame = camera.get_frame(require_pc=False)
+                    refreshed_image, refreshed_pc = base.preprocess_camera_frame(
+                        refreshed_frame
+                    )
+                    history.append(
+                        {
+                            "agent_pos": refreshed_state,
+                            "point_cloud": refreshed_pc,
+                            "image": refreshed_image,
+                        }
+                    )
+                    time.sleep(1.0 / args.rate)
+                last_state = history[-1]["agent_pos"].copy()
         operator.start()
 
         next_deadline = time.monotonic()
@@ -717,6 +749,7 @@ def main() -> None:
                 "cooldown_frames": args.cooldown_frames,
                 "probability_window": [args.window_start, args.window_end],
                 "allow_gripper_events": args.allow_gripper_events,
+                "initial_gripper_state": args.initial_gripper_state,
                 "open_width_m": args.open_width_m,
                 "close_width_m": args.close_width_m,
                 "stop_reason": stop_reason,
