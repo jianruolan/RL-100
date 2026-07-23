@@ -4,7 +4,8 @@
 该脚本与 ``piper_rosbag_pick_place_to_rl100_zarr.py`` 使用同一套观测/动作约定：
 
 * observation agent_pos: ``[joint_feedback_rad(6), gripper_width_m]``；
-* action: ``[joint_target_rad(6), gripper_width_m]``，是绝对目标，不是增量；
+* policy action: ``[joint_target_rad(6), gripper_open_command(0/1)]``；
+  推理安全层会把第7维解码为物理夹爪宽度后再限速下发；
 * 从训练输出目录的 Hydra 配置自动读取 ``n_obs_steps``、``horizon``
   和 ``n_action_steps``，兼容不同长度的 action chunk。默认使用
   receding-horizon：每个控制周期重新推理，只执行当前 chunk 的第一步。
@@ -207,9 +208,19 @@ def extract_action_chunk(
 def training_stats(dataset) -> dict[str, np.ndarray]:
     replay = dataset.replay_buffer
     state = np.asarray(replay["state"][:], dtype=np.float32)
-    action = np.asarray(replay["action"][:], dtype=np.float32)
+    # Piper数据配置使用policy_action；不要硬编码成旧数据集的action键。
+    action_key = str(getattr(dataset, "action_key", "action"))
+    if action_key not in replay:
+        raise KeyError(
+            f"数据集动作键{action_key!r}不存在，实际keys={list(replay.keys())}"
+        )
+    action = np.asarray(replay[action_key][:], dtype=np.float32)
     pcs = np.asarray(replay["point_cloud"][:: max(1, len(replay["point_cloud"]) // 2000)], dtype=np.float32)
     flat_pc = pcs.reshape(-1, 3)
+    # 新数据的第7维是0/1开合命令；旧数据可能直接保存0~0.07m宽度。
+    gripper_action_mode = (
+        "command" if float(action[:, 6].max()) > GRIPPER_UPPER_M + 0.1 else "width"
+    )
     return {
         "state_min": state.min(axis=0),
         "state_max": state.max(axis=0),
@@ -218,6 +229,8 @@ def training_stats(dataset) -> dict[str, np.ndarray]:
         "action_delta_p99": np.percentile(np.abs(action - state), 99, axis=0),
         "pc_low": np.percentile(flat_pc, 0.1, axis=0),
         "pc_high": np.percentile(flat_pc, 99.9, axis=0),
+        "action_key": action_key,
+        "gripper_action_mode": gripper_action_mode,
     }
 
 
@@ -247,6 +260,22 @@ def safe_action(predicted: np.ndarray, current: np.ndarray, stats: dict[str, np.
     if args.skip_current_joint_range_check:
         warnings.append("已跳过当前关节训练范围检查")
     target = predicted.copy()
+
+    # 原始7D diffusion直接回归0/1夹爪命令。predict_action()反归一化后，
+    # 这里只做部署语义解码；前6维关节目标完全不受影响。
+    command_coded = stats.get("gripper_action_mode") == "command"
+    if command_coded:
+        raw_gripper_command = float(target[6])
+        gripper_open = raw_gripper_command >= args.gripper_command_threshold
+        target[6] = (
+            GRIPPER_UPPER_M
+            if gripper_open
+            else GRIPPER_LOWER_M
+        )
+        warnings.append(
+            f"夹爪命令{raw_gripper_command:.3f}解码为"
+            f"{'张开' if gripper_open else '闭合'}"
+        )
     if np.any(target[:6] < lower) or np.any(target[:6] > upper):
         if not args.clip_actions:
             raise RuntimeError("策略关节目标超出训练范围，已停止；可显式传 --clip-actions")
@@ -263,11 +292,24 @@ def safe_action(predicted: np.ndarray, current: np.ndarray, stats: dict[str, np.
     if args.skip_gripper_safety_check:
         warnings.append("已跳过夹爪范围和速度检查")
     else:
-        grip_lower = max(GRIPPER_LOWER_M, float(stats["action_min"][6]) - args.gripper_margin_m)
-        grip_upper = min(GRIPPER_UPPER_M, float(stats["action_max"][6]) + args.gripper_margin_m)
-        if not grip_lower <= current[6] <= grip_upper:
+        if command_coded:
+            # 命令空间是0/1，物理安全范围必须来自反馈宽度state，而非命令值。
+            grip_lower = max(
+                GRIPPER_LOWER_M,
+                float(stats["state_min"][6]) - args.gripper_margin_m,
+            )
+            grip_upper = min(
+                GRIPPER_UPPER_M,
+                float(stats["state_max"][6]) + args.gripper_margin_m,
+            )
+        else:
+            grip_lower = max(GRIPPER_LOWER_M, float(stats["action_min"][6]) - args.gripper_margin_m)
+            grip_upper = min(GRIPPER_UPPER_M, float(stats["action_max"][6]) + args.gripper_margin_m)
+        # Zarr float32中的0.07可能表示为0.0700000003，给物理边界留数值容差。
+        grip_eps = 1e-6
+        if current[6] < grip_lower - grip_eps or current[6] > grip_upper + grip_eps:
             raise RuntimeError(f"当前夹爪宽度 {current[6]:.4f}m 超出训练分布 [{grip_lower:.4f},{grip_upper:.4f}]m")
-        if target[6] < grip_lower or target[6] > grip_upper:
+        if target[6] < grip_lower - grip_eps or target[6] > grip_upper + grip_eps:
             if not args.clip_actions:
                 raise RuntimeError("策略夹爪目标超出训练范围，已停止；可显式传 --clip-actions")
             target[6] = np.clip(target[6], grip_lower, grip_upper)
@@ -377,6 +419,12 @@ def parse_args():
     )
     p.add_argument("--dataset-margin-rad", type=float, default=0.03)
     p.add_argument("--gripper-margin-m", type=float, default=0.005)
+    p.add_argument(
+        "--gripper-command-threshold",
+        type=float,
+        default=0.5,
+        help="第7维为0/1命令时的开合阈值；不改变训练模型。",
+    )
     p.add_argument("--max-joint-speed-rad-s", type=float, default=0.15)
     p.add_argument("--max-gripper-speed-m-s", type=float, default=0.02)
     p.add_argument(
@@ -413,6 +461,8 @@ def main():
         raise ValueError("--chunk-exec-steps 必须为正整数")
     if not 1 <= args.speed_percent <= 100:
         raise ValueError("--speed-percent 必须在 [1,100]")
+    if not 0.0 < args.gripper_command_threshold < 1.0:
+        raise ValueError("--gripper-command-threshold 必须在 (0,1)")
     if args.rate > 15:
         print(
             "[时序警告] 当前 rate 高于采集相机的 15Hz；训练 transition 实际约 13Hz，"
@@ -463,6 +513,12 @@ def main():
         stats = training_stats(dataset)
         print("[训练范围] state:", stats["state_min"], stats["state_max"], flush=True)
         print("[训练范围] action:", stats["action_min"], stats["action_max"], flush=True)
+        print(
+            f"[夹爪动作] key={stats['action_key']}，"
+            f"mode={stats['gripper_action_mode']}，"
+            f"threshold={args.gripper_command_threshold:g}",
+            flush=True,
+        )
         C_PiperInterface_V2 = contact.import_piper_sdk(args.piper_sdk_root)
         piper = C_PiperInterface_V2(args.can)
         piper.ConnectPort()

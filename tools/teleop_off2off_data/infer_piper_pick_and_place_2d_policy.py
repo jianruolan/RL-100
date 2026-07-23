@@ -141,6 +141,8 @@ def parse_args():
     p.add_argument("--skip-current-joint-range-check", action="store_true")
     p.add_argument("--dataset-margin-rad", type=float, default=0.03)
     p.add_argument("--gripper-margin-m", type=float, default=0.005)
+    p.add_argument("--gripper-command-threshold", type=float, default=0.5,
+                   help="第7维0/1夹爪命令的开合阈值。")
     p.add_argument("--max-joint-speed-rad-s", type=float, default=0.15)
     p.add_argument("--max-gripper-speed-m-s", type=float, default=0.02)
     p.add_argument("--skip-gripper-safety-check", action="store_true")
@@ -159,6 +161,8 @@ def main():
         raise ValueError("需要 0<rate<=20 且 camera-fps 不低于 rate")
     if args.chunk_exec_steps < 1:
         raise ValueError("--chunk-exec-steps 必须为正整数")
+    if not 0.0 < args.gripper_command_threshold < 1.0:
+        raise ValueError("--gripper-command-threshold 必须在 (0,1)")
     if args.rate > 15:
         print("[时序警告] 当前推理频率高于采集数据实际约13Hz", flush=True)
     args.output_dir = args.output_dir.expanduser().resolve()
@@ -188,6 +192,11 @@ def main():
         )
     device = torch.device(args.device)
     stats = training_stats(dataset)
+    print(
+        f"[夹爪动作] key={stats['action_key']}，mode={stats['gripper_action_mode']}，"
+        f"threshold={args.gripper_command_threshold:g}",
+        flush=True,
+    )
     if args.offline_smoke:
         offline_smoke(dataset, policy, device, use_cm, expected_steps=n_action_steps)
         return
