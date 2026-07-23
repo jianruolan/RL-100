@@ -9,6 +9,7 @@ gpu_id="${GPU_ID:-0}"
 run_dir="${RUN_DIR:-data/outputs/piper_pick_and_place_augmented_rgbd_resnet18_chunk4_seed${seed}}"
 resume="${RESUME:-False}"
 dataset_path="${DATASET_PATH:-data/piper_pick_and_place_augmented_rgbd224.zarr}"
+python_bin="${PYTHON_BIN:-python}"
 
 cd "$(dirname "$0")/../../../.."
 cd RL-100
@@ -17,7 +18,7 @@ export MUJOCO_GL=egl MUJOCO_EGL_DEVICE_ID="${gpu_id}"
 export MUJOCO_PY_MUJOCO_PATH="${MUJOCO_PY_MUJOCO_PATH:-$HOME/.mujoco/mujoco210}"
 export LD_LIBRARY_PATH="${MUJOCO_PY_MUJOCO_PATH}/bin:${MUJOCO_PY_MUJOCO_PATH}/lib:/usr/lib/nvidia:${LD_LIBRARY_PATH:-}"
 
-python train.py --config-name=rl100_2d_epsilon.yaml \
+"${python_bin}" train.py --config-name=rl100_2d_epsilon.yaml \
   task="${task_name}" hydra.run.dir="${run_dir}" \
   training.debug=False training.seed="${seed}" training.device=cuda:0 \
   exp_name="${task_name}-${alg_name}-${addition_info}" \

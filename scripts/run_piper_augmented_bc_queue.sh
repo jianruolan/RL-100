@@ -3,6 +3,7 @@
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+python_bin="${PYTHON_BIN:-/home/mtarch/miniforge3/envs/rl100_test/bin/python}"
 log_dir="${repo_root}/RL-100/data/outputs/piper_augmented_bc_queue"
 mkdir -p "${log_dir}"
 queue_log="${log_dir}/queue.log"
@@ -87,9 +88,9 @@ wait_until_allowed
 cd "${repo_root}"
 
 run_with_resume "3d_chunk4_bc" \
-  "GPU_ID=${gpu_id} RUN_DIR=data/outputs/piper_pick_and_place_augmented_chunk4_seed42 bash scripts/Diffusion/Offline/3D/train_policy_piper_pick_and_place_augmented.sh rl100 piper_pick_and_place_augmented chunk4-bc 42"
+  "PYTHON_BIN=${python_bin} GPU_ID=${gpu_id} RUN_DIR=data/outputs/piper_pick_and_place_augmented_chunk4_seed42 bash scripts/Diffusion/Offline/3D/train_policy_piper_pick_and_place_augmented.sh rl100 piper_pick_and_place_augmented chunk4-bc 42"
 
 run_with_resume "2d_rgbd_resnet18_chunk4_bc" \
-  "GPU_ID=${gpu_id} BATCH_SIZE=32 RUN_DIR=data/outputs/piper_pick_and_place_augmented_rgbd_resnet18_chunk4_seed42 bash scripts/Diffusion/Offline/2D/train_policy_piper_pick_and_place_rgbd.sh rl100 piper_pick_and_place_augmented_rgbd rgbd-resnet18-chunk4-bc 42"
+  "PYTHON_BIN=${python_bin} GPU_ID=${gpu_id} BATCH_SIZE=32 RUN_DIR=data/outputs/piper_pick_and_place_augmented_rgbd_resnet18_chunk4_seed42 bash scripts/Diffusion/Offline/2D/train_policy_piper_pick_and_place_rgbd.sh rl100 piper_pick_and_place_augmented_rgbd rgbd-resnet18-chunk4-bc 42"
 
 log "两个BC实验均已完成"
