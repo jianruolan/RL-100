@@ -6,6 +6,9 @@
 
 * state  = [六个关节反馈(rad), 夹爪总开口宽度(m)]
 * action = [六个实际下发关节目标(rad), 夹爪 position(m)]
+* policy_action = [六个实际下发关节目标(rad), 夹爪期望开合状态]
+* gripper_command_state = Pico 开合命令锁存后的期望状态（1=张开，0=闭合）
+* gripper_open/close_event = 相邻保留 RGB 帧之间是否出现对应命令
 * 采样时间轴采用 RGB bag timestamp，其他 topic 做最近邻/线性插值。
 * 点云由深度图和深度相机内参反投影，坐标系是深度相机 optical frame。
 * 仅转换元数据明确标记为成功且 rosbag 完整的 episode。
@@ -34,6 +37,7 @@ REQUIRED_TOPICS = {
     "/joint_states",
     "/piper_teleop/status",
     "/piper_teleop/gripper/position",
+    "/piper_teleop/pico_frame",
     "/piper_camera/d435i/color/image_raw",
     "/piper_camera/d435i/depth/image_rect_raw",
     "/piper_camera/d435i/depth/camera_info",
@@ -336,6 +340,70 @@ def load_status_stream(bag: BagIndex) -> tuple[np.ndarray, list[dict[str, Any]]]
     return times, values
 
 
+def load_pico_command_stream(bag: BagIndex) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """读取 Pico 帧里的夹爪开合命令。
+
+    该 topic 是 ``std_msgs/String`` 包裹的 JSON。命令字段位于 JSON 顶层，不能
+    从 ``controllerInput`` 中猜测按键映射。
+    """
+    rows = bag.rows("/piper_teleop/pico_frame")
+    times = np.asarray([row[1] for row in rows], dtype=np.int64)
+    open_commands, close_commands = [], []
+    for _, _, blob in rows:
+        value = json.loads(decode_std_string(blob))
+        if "gripperOpen" not in value or "gripperClose" not in value:
+            raise RuntimeError("Pico JSON missing gripperOpen/gripperClose")
+        open_commands.append(bool(value["gripperOpen"]))
+        close_commands.append(bool(value["gripperClose"]))
+    return (
+        times,
+        np.asarray(open_commands, dtype=bool),
+        np.asarray(close_commands, dtype=bool),
+    )
+
+
+def align_gripper_commands(
+    pico_times: np.ndarray,
+    open_commands: np.ndarray,
+    close_commands: np.ndarray,
+    frame_times: np.ndarray,
+    initial_open: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """把异步 Pico 短脉冲转换到 RGB 主时间轴。
+
+    对每个 RGB 帧处理上一帧之后、当前帧之前（含当前时间）的全部 Pico 消息，
+    避免用最近邻采样时漏掉短按键脉冲。第一帧之前的消息也会在首个区间处理；
+    首帧测量宽度只负责提供没有命令时的初始锁存状态。
+    """
+    if len(frame_times) == 0:
+        raise ValueError("frame_times must not be empty")
+    command_state = np.empty(len(frame_times), dtype=np.uint8)
+    open_event = np.zeros(len(frame_times), dtype=np.uint8)
+    close_event = np.zeros(len(frame_times), dtype=np.uint8)
+    desired_open = bool(initial_open)
+    cursor = 0
+    conflicts = 0
+    for frame_i, frame_time in enumerate(frame_times):
+        while cursor < len(pico_times) and int(pico_times[cursor]) <= int(frame_time):
+            open_now = bool(open_commands[cursor])
+            close_now = bool(close_commands[cursor])
+            if open_now:
+                open_event[frame_i] = 1
+            if close_now:
+                close_event[frame_i] = 1
+            if open_now and close_now:
+                # 异常冲突时闭合优先，避免把含糊命令解释成意外松爪。
+                conflicts += 1
+                desired_open = False
+            elif close_now:
+                desired_open = False
+            elif open_now:
+                desired_open = True
+            cursor += 1
+        command_state[frame_i] = int(desired_open)
+    return command_state, open_event, close_event, conflicts
+
+
 def construct_next(array: np.ndarray) -> np.ndarray:
     out = np.empty_like(array)
     out[:-1] = array[1:]
@@ -353,6 +421,7 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
         grip_times, grip = load_numeric_stream(bag, "/piper_teleop/gripper/position", decode_float64)
         grip = grip.reshape(-1, 1)
         status_times, statuses = load_status_stream(bag)
+        pico_times, pico_open, pico_close = load_pico_command_stream(bag)
         rgb_times, rgb_header_times, rgb_ids = bag.image_message_index(
             "/piper_camera/d435i/color/image_raw"
         )
@@ -454,17 +523,35 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
                 raise RuntimeError(f"non-finite value in {name}")
 
         n = len(state)
+        gripper_command_state, gripper_open_event, gripper_close_event, pico_conflicts = (
+            align_gripper_commands(
+                pico_times,
+                pico_open,
+                pico_close,
+                np.asarray(retained_rgb_times, dtype=np.int64),
+                initial_open=bool(state[0, 6] >= args.gripper_open_threshold_m),
+            )
+        )
+        gripper_command_state = gripper_command_state[:, None]
+        gripper_open_event = gripper_open_event[:, None]
+        gripper_close_event = gripper_close_event[:, None]
         reward = np.zeros((n, 1), dtype=np.float32)
         reward[-1, 0] = args.terminal_reward
         done = np.zeros((n, 1), dtype=bool)
         timeout = np.zeros((n, 1), dtype=bool)
         done[-1, 0] = True
         timeout[-1, 0] = True
+        # 新训练应读取 policy_action；旧 action 保留用于兼容与逐项验证。
+        policy_action = np.concatenate(
+            [action[:, :6], gripper_command_state.astype(np.float32)], axis=-1
+        )
         arrays = {
             "state": state,
             "next_state": construct_next(state),
             "action": action,
             "next_action": construct_next(action),
+            "policy_action": policy_action,
+            "next_policy_action": construct_next(policy_action),
             "point_cloud": point_cloud,
             "next_point_cloud": construct_next(point_cloud),
             "img": image,
@@ -472,6 +559,12 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
             "reward": reward,
             "done": done,
             "timeout": timeout,
+            "gripper_command_state": gripper_command_state,
+            "next_gripper_command_state": construct_next(gripper_command_state),
+            "gripper_open_event": gripper_open_event,
+            "next_gripper_open_event": construct_next(gripper_open_event),
+            "gripper_close_event": gripper_close_event,
+            "next_gripper_close_event": construct_next(gripper_close_event),
         }
 
         def stats(values: Iterable[float]) -> dict[str, float]:
@@ -487,6 +580,17 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
             "duration_sec": float((retained_rgb_times[-1] - retained_rgb_times[0]) / 1e9) if n > 1 else 0.0,
             "rgb_rate_hz": float((n - 1) / ((retained_rgb_times[-1] - retained_rgb_times[0]) / 1e9)) if n > 1 else 0.0,
             "control_accepted_ratio": float(np.mean(control_accepted)),
+            "gripper_commands": {
+                "initial_open_from_feedback": bool(
+                    state[0, 6] >= args.gripper_open_threshold_m
+                ),
+                "state_transitions": int(
+                    np.count_nonzero(np.diff(gripper_command_state[:, 0]))
+                ),
+                "open_event_frames": int(gripper_open_event.sum()),
+                "close_event_frames": int(gripper_close_event.sum()),
+                "conflicting_pico_messages": int(pico_conflicts),
+            },
             "sync": {
                 "depth_camera_header": stats(depth_header_errors),
                 "depth_bag_write_time": stats(depth_bag_errors),
@@ -554,9 +658,22 @@ def write_zarr(episodes: list[dict[str, np.ndarray]], reports: list[dict[str, An
     create_array(meta, "episode_ends", np.asarray(episode_ends, dtype=np.int64))
     root.attrs.update(
         {
-            "schema": "rl100_replay_zarr_from_piper_rosbag_pick_place_v1",
+            "schema": "rl100_replay_zarr_from_piper_rosbag_pick_place_v2_gripper_commands",
             "state_definition": "joint_feedback_rad[0:6] + gripper_total_width_m",
-            "action_definition": "ikCommandJointMdeg_to_rad[0:6] + gripper_position_m",
+            "action_definition": (
+                "ikCommandJointMdeg_to_rad[0:6] + gripper_position_m; action[6] is legacy "
+                "feedback compatibility only, use data/gripper_command_state for gripper supervision"
+            ),
+            "policy_action_definition": (
+                "ikCommandJointMdeg_to_rad[0:6] + latched gripper command state; "
+                "use this tensor for new BC/CM/Q/dynamics/offline training"
+            ),
+            "gripper_command_definition": {
+                "state": "latched Pico command, uint8: 1=open, 0=close",
+                "open_event": "any gripperOpen=true Pico message since previous retained RGB frame",
+                "close_event": "any gripperClose=true Pico message since previous retained RGB frame",
+                "initial_feedback_threshold_m": args.gripper_open_threshold_m,
+            },
             "point_cloud_frame": "d435i_depth_optical_frame",
             "point_cloud_depth_scale_m": 0.001,
             "image_preprocessing": {
@@ -573,8 +690,12 @@ def write_zarr(episodes: list[dict[str, np.ndarray]], reports: list[dict[str, An
 def validate_zarr(path: Path, expected_episodes: int) -> dict[str, Any]:
     root = zarr.open(str(path), mode="r")
     required = {
-        "state", "next_state", "action", "next_action", "point_cloud", "next_point_cloud",
+        "state", "next_state", "action", "next_action", "policy_action", "next_policy_action",
+        "point_cloud", "next_point_cloud",
         "img", "next_img", "reward", "return", "done", "timeout",
+        "gripper_command_state", "next_gripper_command_state",
+        "gripper_open_event", "next_gripper_open_event",
+        "gripper_close_event", "next_gripper_close_event",
     }
     missing = required - set(root["data"].keys())
     if missing:
@@ -590,6 +711,30 @@ def validate_zarr(path: Path, expected_episodes: int) -> dict[str, Any]:
         raise RuntimeError("state/action must both be 7-D")
     state = root["data/state"][:]
     action = root["data/action"][:]
+    policy_action = root["data/policy_action"][:]
+    command_state = root["data/gripper_command_state"][:]
+    open_event = root["data/gripper_open_event"][:]
+    close_event = root["data/gripper_close_event"][:]
+    for name, value in {
+        "gripper_command_state": command_state,
+        "gripper_open_event": open_event,
+        "gripper_close_event": close_event,
+    }.items():
+        if value.shape != (n, 1) or not np.all((value == 0) | (value == 1)):
+            raise RuntimeError(f"{name} must have shape ({n}, 1) and contain only 0/1")
+    if policy_action.shape != action.shape:
+        raise RuntimeError(
+            f"policy_action shape {policy_action.shape} != action shape {action.shape}"
+        )
+    if not np.array_equal(policy_action[:, :6], action[:, :6]):
+        raise RuntimeError("policy_action joint targets differ from action joint targets")
+    if not np.array_equal(policy_action[:, 6], command_state[:, 0].astype(np.float32)):
+        raise RuntimeError("policy_action gripper dimension differs from command state")
+    starts = np.r_[0, ends[:-1]]
+    transitions_per_episode = [
+        int(np.count_nonzero(np.diff(command_state[start:end, 0])))
+        for start, end in zip(starts, ends)
+    ]
     return {
         "episodes": len(ends),
         "transitions": n,
@@ -597,6 +742,12 @@ def validate_zarr(path: Path, expected_episodes: int) -> dict[str, Any]:
         "state_max": state.max(axis=0).tolist(),
         "action_min": action.min(axis=0).tolist(),
         "action_max": action.max(axis=0).tolist(),
+        "policy_action_min": policy_action.min(axis=0).tolist(),
+        "policy_action_max": policy_action.max(axis=0).tolist(),
+        "gripper_command_open_ratio": float(command_state.mean()),
+        "gripper_open_event_frames": int(open_event.sum()),
+        "gripper_close_event_frames": int(close_event.sum()),
+        "gripper_state_transitions_per_episode": transitions_per_episode,
     }
 
 
@@ -638,6 +789,12 @@ def parse_args():
     parser.add_argument("--min-episode-len", type=int, default=2)
     parser.add_argument("--terminal-reward", type=float, default=1.0)
     parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument(
+        "--gripper-open-threshold-m",
+        type=float,
+        default=0.061,
+        help="仅用于每条轨迹首帧的命令状态初始化；后续标签完全由 Pico 命令锁存",
+    )
     return parser.parse_args()
 
 
@@ -685,6 +842,7 @@ def main() -> None:
             "max_depth_m": args.max_depth_m,
             "terminal_reward": args.terminal_reward,
             "gamma": args.gamma,
+            "gripper_open_threshold_m": args.gripper_open_threshold_m,
         },
         "episodes": episode_reports,
         "validation": validation,

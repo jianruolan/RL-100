@@ -1,0 +1,55 @@
+name: piper_pick_and_place_gripper
+
+task_name: piper_pick_and_place_gripper
+
+# 新数据把第7维动作定义为夹爪命令状态，而不是夹爪宽度反馈：
+#   policy_action[:6]：六个实际下发关节目标(rad)
+#   policy_action[6]：0=闭合，1=张开
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: [3, 84, 84]
+      type: rgb
+    point_cloud:
+      shape: [512, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [7]
+
+# 当前只有离线数据，BC、CM、Q/Value、dynamics和offline RL均不调用真机。
+env_runner: null
+
+dataset: &dataset
+  _target_: rl_100.dataset.adroit_dataset.AdroitDataset
+  zarr_path: data/piper_pick_and_place_gripper_commands.zarr
+  action_key: policy_action
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: ${training.seed}
+  val_ratio: 0.125
+  max_train_episodes: null
+  pre_image_norm: False
+  controlled_dims: 7
+
+  # 独立夹爪头：使用3帧编码特征，从未来第3帧开始预测连续12帧状态。
+  use_gripper_head: true
+  n_obs_steps: ${n_obs_steps}
+  gripper_horizon: 12
+  gripper_future_offset: 3
+  gripper_event_radius: 2
+  gripper_event_weight: 10.0
+
+norm_dataset: *dataset
+
+critic_dataset:
+  <<: *dataset
+  val_ratio: 0.0
+
+scale_dataset:
+  <<: *dataset
+  val_ratio: 0.0
+  scale_strategy: dynamic

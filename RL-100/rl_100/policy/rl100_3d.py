@@ -74,6 +74,11 @@ class RL1003D(BasePolicy):
             latent_state_dim: int = None,
             eta: float = 1.0,
             chunk_as_single_action: bool = False,
+            use_gripper_head: bool = False,
+            gripper_horizon: int = 12,
+            gripper_loss_weight: float = 1.0,
+            gripper_head_hidden_dim: int = 256,
+            gripper_head_dropout: float = 0.1,
             # flow matching parameters
             flow_noise_scheduler=None,
             flow_inference_steps: int = 10,
@@ -96,6 +101,9 @@ class RL1003D(BasePolicy):
         self.action_norm = action_norm
         self.eta = eta
         self.chunk_as_single_action = chunk_as_single_action
+        self.use_gripper_head = use_gripper_head
+        self.gripper_horizon = gripper_horizon
+        self.gripper_loss_weight = gripper_loss_weight
         self.is_flow = (scheduler_type == 'flow')
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
@@ -229,6 +237,18 @@ class RL1003D(BasePolicy):
             )
         self.obs_encoder = obs_encoder
         self.model = model
+        if self.use_gripper_head:
+            if gripper_horizon < 1 or gripper_loss_weight < 0:
+                raise ValueError('gripper_horizon必须大于0，gripper_loss_weight不能小于0')
+            # 独立预测未来夹爪开合状态，避免稀疏的开/合切换被连续 diffusion 损失淹没。
+            self.gripper_head = nn.Sequential(
+                nn.Linear(obs_feature_dim * n_obs_steps, gripper_head_hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(gripper_head_dropout),
+                nn.Linear(gripper_head_hidden_dim, gripper_horizon),
+            )
+        else:
+            self.gripper_head = None
 
         # set ddim as ODE solver, distill to consistency model
         self.ddim_scheduler = ddim_noise_scheduler
@@ -741,6 +761,11 @@ class RL1003D(BasePolicy):
             'action': action,
             'action_pred': action_pred,
         }
+        if self.use_gripper_head:
+            # 夹爪头与 diffusion 复用同一次视觉/点云编码，不额外执行 encoder。
+            gripper_logits = self.gripper_head(nobs_features.reshape(B, -1))
+            result['gripper_logits'] = gripper_logits
+            result['gripper_prob'] = torch.sigmoid(gripper_logits)
         return result
 
     # ========= training  ============
@@ -794,6 +819,53 @@ class RL1003D(BasePolicy):
         this_nobs = dict_apply(nobs, 
             lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]).to(self.device))
         return this_nobs
+
+    def compute_gripper_loss(self, nobs_features, batch):
+        """计算未来夹爪状态损失，以及开、合事件附近更有解释力的指标。"""
+        required = (
+            'gripper_target', 'gripper_valid_mask', 'gripper_event_weight',
+            'gripper_open_event_mask', 'gripper_close_event_mask',
+        )
+        missing = [key for key in required if key not in batch]
+        if missing:
+            raise KeyError(f'use_gripper_head=True，但batch缺少字段: {missing}')
+
+        target = batch['gripper_target'].to(nobs_features.dtype)
+        logits = self.gripper_head(nobs_features.reshape(target.shape[0], -1))
+        valid = batch['gripper_valid_mask'].to(logits.dtype)
+        event_weight = batch['gripper_event_weight'].to(logits.dtype)
+        if logits.shape != target.shape:
+            raise ValueError(f'夹爪输出/标签shape不一致: {tuple(logits.shape)} vs {tuple(target.shape)}')
+
+        element_loss = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+        weighted_valid = event_weight * valid
+        denominator = weighted_valid.sum().clamp_min(1.0)
+        loss = (element_loss * weighted_valid).sum() / denominator
+
+        with torch.no_grad():
+            prediction = logits >= 0
+            target_bool = target >= 0.5
+            valid_bool = valid > 0
+            correct = prediction == target_bool
+            state_accuracy = (correct * valid_bool).sum().float() / valid_bool.sum().clamp_min(1)
+
+            open_mask = (batch['gripper_open_event_mask'] > 0) & valid_bool
+            close_mask = (batch['gripper_close_event_mask'] > 0) & valid_bool
+            event_mask = open_mask | close_mask
+            open_recall = (prediction & open_mask).sum().float() / open_mask.sum().clamp_min(1)
+            close_recall = ((~prediction) & close_mask).sum().float() / close_mask.sum().clamp_min(1)
+            event_accuracy = (correct & event_mask).sum().float() / event_mask.sum().clamp_min(1)
+
+        metrics = {
+            'gripper_loss': loss.item(),
+            'gripper_state_accuracy': state_accuracy.item(),
+            'gripper_open_event_recall': open_recall.item(),
+            'gripper_close_event_recall': close_recall.item(),
+            'gripper_event_accuracy': event_accuracy.item(),
+            'gripper_event_count': event_mask.sum().item(),
+        }
+        return loss, metrics
+
     def compute_loss(self, batch, fix_encoder=False, online=False):
         # normalize input
         nobs = self.normalizer.normalize(batch['obs'])
@@ -919,19 +991,27 @@ class RL1003D(BasePolicy):
             else:
                 raise ValueError(f"Unsupported prediction type {pred_type}")
         # else: target already set in flow branch above (velocity = noise - trajectory)
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+        diffusion_loss = F.mse_loss(pred, target, reduction='none')
+        diffusion_loss = diffusion_loss * loss_mask.type(diffusion_loss.dtype)
+        diffusion_loss = reduce(diffusion_loss, 'b ... -> b (...)', 'mean')
+        diffusion_loss = diffusion_loss.mean()
+        loss = diffusion_loss
         if self.encoder_type == 'dp3vib':
-            loss += vib_recon_loss
+            loss = loss + vib_recon_loss
+
+        gripper_metrics = {}
+        if self.use_gripper_head and not online:
+            gripper_loss, gripper_metrics = self.compute_gripper_loss(nobs_features, batch)
+            loss = loss + self.gripper_loss_weight * gripper_loss
         
 
         loss_dict = {
                 'bc_loss': loss.item(),
+                'diffusion_loss': diffusion_loss.item(),
                 'kl_loss': loss_items['kl_loss'] if self.encoder_type == 'dp3vib' else 0.0,
                 'recon_loss': loss_items['recon_loss'] if self.encoder_type == 'dp3vib' else 0.0,
             }
+        loss_dict.update(gripper_metrics)
 
         # print(f"t2-t1: {t2-t1:.3f}")
         # print(f"t3-t2: {t3-t2:.3f}")
@@ -1848,6 +1928,15 @@ class RL1003D(BasePolicy):
         
         torch.save(model_to_save.state_dict(), os.path.join(path, 'model.pt'))
         torch.save(encoder_to_save.state_dict(), os.path.join(path, 'encoder.pt'))
+        if self.gripper_head is not None:
+            gripper_head_to_save = (
+                self.gripper_head.module
+                if hasattr(self.gripper_head, 'module') else self.gripper_head
+            )
+            torch.save(
+                gripper_head_to_save.state_dict(),
+                os.path.join(path, 'gripper_head.pt'),
+            )
         # if exist distill model
         if hasattr(self, 'distilled_model'):
             # Handle DDP wrapped distilled model
@@ -1877,6 +1966,20 @@ class RL1003D(BasePolicy):
         if os.path.exists(encoder_path):
             encoder_to_load.load_state_dict(torch.load(encoder_path, map_location='cpu'))
             print(f'Loaded encoder from {encoder_path}')
+        if self.gripper_head is not None:
+            gripper_head_path = os.path.join(path, 'gripper_head.pt')
+            if not os.path.exists(gripper_head_path):
+                raise FileNotFoundError(
+                    f'当前策略启用了夹爪头，但checkpoint缺少 {gripper_head_path}'
+                )
+            gripper_head_to_load = (
+                self.gripper_head.module
+                if hasattr(self.gripper_head, 'module') else self.gripper_head
+            )
+            gripper_head_to_load.load_state_dict(
+                torch.load(gripper_head_path, map_location='cpu')
+            )
+            print(f'Loaded gripper head from {gripper_head_path}')
             
         # Load distilled model if exists
         distilled_path = os.path.join(path, 'distilled_model.pt')

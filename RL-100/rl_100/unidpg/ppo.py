@@ -192,6 +192,11 @@ class ProximalPolicyOptimization:
     ) -> None:
         torch.save(self._policy.model.state_dict(), os.path.join(path, 'model.pt'))
         torch.save(self._policy.obs_encoder.state_dict(), os.path.join(path, 'encoder.pt'))
+        if getattr(self._policy, 'gripper_head', None) is not None:
+            torch.save(
+                self._policy.gripper_head.state_dict(),
+                os.path.join(path, 'gripper_head.pt'),
+            )
         print('Policy parameters saved in {}'.format(path))
     
 
@@ -204,8 +209,19 @@ class ProximalPolicyOptimization:
         # modified_encoder_params = {f"state_mlp.{k}": v for k, v in encoder_params.items()}
         # self._policy.obs_encoder.load_state_dict(modified_encoder_params)
         self._policy.obs_encoder.load_state_dict(torch.load(os.path.join(path, 'encoder.pt'), map_location=self._device))
+        gripper_head_path = os.path.join(path, 'gripper_head.pt')
+        if getattr(self._policy, 'gripper_head', None) is not None:
+            if not os.path.exists(gripper_head_path):
+                raise FileNotFoundError(
+                    f'当前策略启用了夹爪头，但checkpoint缺少 {gripper_head_path}'
+                )
+            self._policy.gripper_head.load_state_dict(
+                torch.load(gripper_head_path, map_location=self._device)
+            )
         self._old_policy.model.load_state_dict(self._policy.model.state_dict())
         self._old_policy.obs_encoder.load_state_dict(self._policy.obs_encoder.state_dict())
+        if getattr(self._policy, 'gripper_head', None) is not None:
+            self._old_policy.gripper_head.load_state_dict(self._policy.gripper_head.state_dict())
         self._policy.to(self._device)
         self._old_policy.to(self._device)
         cprint('1. policy loaded from {}'.format(path), 'green')

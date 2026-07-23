@@ -594,12 +594,16 @@ class TrainDP3Workspace:
                 if (self.epoch % cfg.training.val_every) == 0 and RUN_VALIDATION:
                     with torch.no_grad():
                         val_losses = list()
+                        val_metric_values = dict()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                 loss, loss_dict = self.model.compute_loss(batch)
                                 val_losses.append(loss)
+                                for key, value in loss_dict.items():
+                                    if isinstance(value, (int, float, np.number)):
+                                        val_metric_values.setdefault(key, []).append(float(value))
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
@@ -607,6 +611,9 @@ class TrainDP3Workspace:
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                            for key, values in val_metric_values.items():
+                                if values:
+                                    step_log[f'val_{key}'] = float(np.mean(values))
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
@@ -918,6 +925,10 @@ class TrainDP3Workspace:
                     )
                 self.unio4._policy.model.load_state_dict(self.model.model.state_dict())
                 self.unio4._policy.obs_encoder.load_state_dict(self.model.obs_encoder.state_dict())
+                if getattr(self.model, 'gripper_head', None) is not None:
+                    self.unio4._policy.gripper_head.load_state_dict(
+                        self.model.gripper_head.state_dict()
+                    )
                 self.unio4.set_old_policy()
             elif self.cfg.distill_phase in ('after_dp', 'after_offline'):
                 # distill2cm() already ran on the correct model and promoted the student.
@@ -2727,12 +2738,16 @@ class TrainDP3Workspace:
                 if (self.epoch % cfg.training.val_every) == 0 and self.RUN_VALIDATION:
                     with torch.no_grad():
                         val_losses = list()
+                        val_metric_values = dict()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(self.device, non_blocking=True))
                                 loss, loss_dict = model_to_optimize.compute_loss(batch)
                                 val_losses.append(loss)
+                                for key, value in loss_dict.items():
+                                    if isinstance(value, (int, float, np.number)):
+                                        val_metric_values.setdefault(key, []).append(float(value))
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
@@ -2740,6 +2755,9 @@ class TrainDP3Workspace:
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                            for key, values in val_metric_values.items():
+                                if values:
+                                    step_log[f'val_{key}'] = float(np.mean(values))
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
