@@ -5,9 +5,9 @@
 
 * observation agent_pos: ``[joint_feedback_rad(6), gripper_width_m]``；
 * action: ``[joint_target_rad(6), gripper_width_m]``，是绝对目标，不是增量；
-* 训练为 ``n_obs_steps=3, horizon=6, n_action_steps=4``，即每次模型输出
-  4 步 action chunk。默认使用 receding-horizon：按训练数据实际约 13 Hz 每周期重新推理，
-  只执行当前 chunk 的第一步，因而每个动作都使用最新相机和关节观测。
+* 从训练输出目录的 Hydra 配置自动读取 ``n_obs_steps``、``horizon``
+  和 ``n_action_steps``，兼容不同长度的 action chunk。默认使用
+  receding-horizon：每个控制周期重新推理，只执行当前 chunk 的第一步。
 
 默认是 shadow 模式，只读机械臂/相机和打印动作；只有传入 ``--execute`` 并
 输入确认短语才会使能 Piper。第一次上真机建议先运行 ``--offline-smoke``，
@@ -353,7 +353,8 @@ def parse_args():
         type=int,
         default=1,
         help=(
-            "每次策略推理后依次执行的 action chunk 步数，范围 [1,4]。"
+            "每次策略推理后依次执行的 action chunk 步数，"
+            "上限由权重配置中的 n_action_steps 决定。"
             "--rate 仍表示动作下发频率；默认 1 为逐步重新规划。"
         ),
     )
@@ -398,8 +399,8 @@ def main():
         raise ValueError("--rate 必须在 (0,20] Hz")
     if args.camera_fps < args.rate or args.max_steps <= 0:
         raise ValueError("camera-fps 必须不低于 rate，max-steps 必须为正")
-    if not 1 <= args.chunk_exec_steps <= 4:
-        raise ValueError("--chunk-exec-steps 必须在 [1,4] 内")
+    if args.chunk_exec_steps < 1:
+        raise ValueError("--chunk-exec-steps 必须为正整数")
     if not 1 <= args.speed_percent <= 100:
         raise ValueError("--speed-percent 必须在 [1,100]")
     if args.rate > 15:
@@ -412,11 +413,31 @@ def main():
     cfg, dataset, policy, use_cm = contact.load_policy_and_dataset(args.output_dir, args.policy_subdir, args.device)
     if list(cfg.shape_meta.obs.agent_pos.shape) != [7] or list(cfg.shape_meta.action.shape) != [7]:
         raise RuntimeError(f"训练配置不是 7D：agent_pos={cfg.shape_meta.obs.agent_pos.shape}, action={cfg.shape_meta.action.shape}")
-    if int(cfg.n_obs_steps) != 3 or int(cfg.n_action_steps) != 4 or int(cfg.horizon) != 6:
-        raise RuntimeError(f"训练 chunk 必须是 n_obs_steps=3,n_action_steps=4,horizon=6，当前为 {cfg.n_obs_steps}/{cfg.n_action_steps}/{cfg.horizon}")
+    n_obs_steps = int(cfg.n_obs_steps)
+    n_action_steps = int(cfg.n_action_steps)
+    horizon = int(cfg.horizon)
+    if n_obs_steps < 1 or n_action_steps < 1:
+        raise RuntimeError(
+            f"训练配置的 n_obs_steps/n_action_steps 必须为正整数，"
+            f"当前为 {n_obs_steps}/{n_action_steps}"
+        )
+    expected_horizon = n_obs_steps - 1 + n_action_steps
+    if horizon != expected_horizon:
+        raise RuntimeError(
+            "当前推理脚本要求 horizon = n_obs_steps - 1 + n_action_steps，"
+            f"当前为 {horizon} != {n_obs_steps}-1+{n_action_steps}="
+            f"{expected_horizon}"
+        )
+    if args.chunk_exec_steps > n_action_steps:
+        raise ValueError(
+            f"--chunk-exec-steps={args.chunk_exec_steps} 超过模型 "
+            f"n_action_steps={n_action_steps}"
+        )
     device = torch.device(args.device)
     if args.offline_smoke:
-        offline_smoke(dataset, policy, device, use_cm, expected_steps=4)
+        offline_smoke(
+            dataset, policy, device, use_cm, expected_steps=n_action_steps
+        )
         return
 
     from tools.teleop_off2off_data.realsense import RealSense
@@ -442,7 +463,8 @@ def main():
     print("[相机] RGB=RGB8预处理，Depth=未对齐原始深度，点云坐标=d435i_depth_optical_frame", flush=True)
     print("[模式]", "真机执行" if args.execute else "影子模式（不下发）", flush=True)
     print(
-        f"[动作] 训练 chunk=4，每次推理依次执行前 {args.chunk_exec_steps} 步；"
+        f"[动作] 训练 chunk={n_action_steps}，每次推理依次执行前 "
+        f"{args.chunk_exec_steps} 步；"
         f"动作下发 {args.rate:g}Hz，模型重规划约 "
         f"{args.rate / args.chunk_exec_steps:g}Hz",
         flush=True,
@@ -455,7 +477,7 @@ def main():
     if args.skip_point_cloud_distribution_check:
         print("[安全警告] 已跳过点云分布停止检查，pc_out 仍会记录到终端和日志", flush=True)
 
-    history = deque(maxlen=3)
+    history = deque(maxlen=n_obs_steps)
     records = []
     operator = contact.OperatorConsole()
     robot_enabled = False
@@ -468,8 +490,8 @@ def main():
     last_grip_fresh = time.monotonic()
     episode_noise = contact.make_episode_diffusion_noise(policy, device, args.diffusion_noise_seed) if args.reuse_diffusion_noise else None
     try:
-        # 用三帧实时数据填满观察窗口，不复制第一帧。
-        for _ in range(3):
+        # 用实时数据填满训练配置中的观察窗口，不复制第一帧。
+        for _ in range(n_obs_steps):
             state, _, _ = reader.read()
             frame = camera.get_frame(require_pc=False)
             image, pc = preprocess_camera_frame(frame)
@@ -535,7 +557,9 @@ def main():
                         use_cm=use_cm,
                         initial_noise=episode_noise,
                     )
-                active_chunk = extract_action_chunk(output, expected_steps=4)
+                active_chunk = extract_action_chunk(
+                    output, expected_steps=n_action_steps
+                )
                 inference_index += 1
                 chunk_step = 0
             predicted_action = active_chunk[chunk_step]
@@ -595,7 +619,7 @@ def main():
         if not log_path.is_absolute():
             log_path = REPO_ROOT / log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "n_obs_steps": 3, "horizon": 6, "n_action_steps": 4, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[日志] 已保存: {log_path.resolve()}", flush=True)
 
 
