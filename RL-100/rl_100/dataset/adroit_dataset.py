@@ -37,6 +37,7 @@ class AdroitDataset(BaseDataset):
             pre_image_norm=False,
             sequence_stride=1,
             controlled_dims=None,
+            action_dims=None,
             action_key='action',
             use_gripper_head=False,
             n_obs_steps=1,
@@ -48,6 +49,8 @@ class AdroitDataset(BaseDataset):
         super().__init__()
         self.task_name = task_name
         self.controlled_dims = controlled_dims
+        # agent_pos可以保留7维（含夹爪反馈），同时让arm-only diffusion只学习前6维动作。
+        self.action_dims = controlled_dims if action_dims is None else action_dims
         self.action_key = action_key
         self.next_action_key = (
             'next_action' if action_key == 'action' else f'next_{action_key}'
@@ -171,14 +174,15 @@ class AdroitDataset(BaseDataset):
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):
-        dim_slice = slice(None, self.controlled_dims)
+        state_slice = slice(None, self.controlled_dims)
+        action_slice = slice(None, self.action_dims)
         data = {
-            'action': self.replay_buffer[self.action_key][..., dim_slice],
-            'agent_pos': self.replay_buffer['state'][..., dim_slice],
+            'action': self.replay_buffer[self.action_key][..., action_slice],
+            'agent_pos': self.replay_buffer['state'][..., state_slice],
             'point_cloud': self.replay_buffer['point_cloud'],
 
-            'next_action': self.replay_buffer[self.next_action_key][..., dim_slice],
-            'next_agent_pos': self.replay_buffer['next_state'][..., dim_slice],
+            'next_action': self.replay_buffer[self.next_action_key][..., action_slice],
+            'next_agent_pos': self.replay_buffer['next_state'][..., state_slice],
             'next_point_cloud': self.replay_buffer['next_point_cloud'],
 
             # 'reward': self.replay_buffer['reward'],
@@ -193,14 +197,15 @@ class AdroitDataset(BaseDataset):
         return len(self.sampler)
 
     def _sample_to_data(self, sample, valid_mask=None):
-        dim_slice = slice(None, self.controlled_dims)
+        state_slice = slice(None, self.controlled_dims)
+        action_slice = slice(None, self.action_dims)
         # 扩展采样窗口只服务于夹爪标签，主训练数据仍严格保持配置中的 horizon。
         main = slice(0, self.horizon)
-        agent_pos = sample['state'][main, dim_slice].astype(np.float32) # (agent_posx2, block_posex3)
+        agent_pos = sample['state'][main, state_slice].astype(np.float32) # (agent_posx2, block_posex3)
         point_cloud = sample['point_cloud'][main,].astype(np.float32) # (T, 1024, 6)
         image = sample['img'][main,].astype(np.float32) # (T, 3, 64, 64)
         
-        next_agent_pos = sample['next_state'][main, dim_slice].astype(np.float32) # (agent_posx2, block_posex3)
+        next_agent_pos = sample['next_state'][main, state_slice].astype(np.float32) # (agent_posx2, block_posex3)
         next_point_cloud = sample['next_point_cloud'][main,].astype(np.float32) # (T, 1024, 6)
         next_image = sample['next_img'][main,].astype(np.float32) # (T, 3, 64, 64)
 
@@ -218,8 +223,8 @@ class AdroitDataset(BaseDataset):
             'reward': sample['reward'][main].astype(np.float32), # T, D_action
             'not_done': 1. - sample['done'][main].astype(np.bool_), # T, D_action
             'return': sample['return'][main].astype(np.float32), # T, D_action
-            'action': sample[self.action_key][main, dim_slice].astype(np.float32), # T, D_action
-            'next_action': sample[self.next_action_key][main, dim_slice].astype(np.float32) # T, D_action
+            'action': sample[self.action_key][main, action_slice].astype(np.float32), # T, D_action
+            'next_action': sample[self.next_action_key][main, action_slice].astype(np.float32) # T, D_action
         }
 
         if self.use_gripper_head:
@@ -262,8 +267,9 @@ class AdroitDataset(BaseDataset):
         return data
     def get_shape_info(self, n_action_steps, n_obs_steps):
         sample = self.sampler.sample_sequence(10)
-        dim_slice = slice(None, self.controlled_dims)
-        agent_pos = sample['state'][:, dim_slice].astype(np.float32) # (agent_posx2, block_posex3)
+        state_slice = slice(None, self.controlled_dims)
+        action_slice = slice(None, self.action_dims)
+        agent_pos = sample['state'][:, state_slice].astype(np.float32) # (agent_posx2, block_posex3)
         point_cloud = sample['point_cloud'][:,].astype(np.float32) # (T, 1024, 6)
         image = sample['img'][:,].astype(np.float32) # (T, 3, 64, 64)
 
@@ -273,7 +279,7 @@ class AdroitDataset(BaseDataset):
             'agent_pos': (n_obs_steps,) + agent_pos.shape[1:],
             'image': (n_obs_steps,) + image.shape[1:],
         },
-        'action': (n_action_steps, sample[self.action_key][:, dim_slice].shape[-1]),
+        'action': (n_action_steps, sample[self.action_key][:, action_slice].shape[-1]),
         }
         return shape_info
     def get_all_data(self,) -> Dict[str, torch.Tensor]:

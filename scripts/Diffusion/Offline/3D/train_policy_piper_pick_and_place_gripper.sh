@@ -7,7 +7,8 @@
 #
 # 默认执行：BC -> CM蒸馏 -> Q/Value -> dynamics -> offline RL。
 # 可用环境变量：GPU_ID、OFFLINE、RESUME、RUN_DIR、DATASET_PATH、
-# ACTION_STEPS、N_OBS_STEPS、HORIZON、DISTILL_PHASE。
+# ACTION_STEPS、N_OBS_STEPS、HORIZON、DISTILL_PHASE、ARM_ACTION_DIMS、
+# GRIPPER_DETACH_ENCODER。
 set -euo pipefail
 
 alg_name="${1:-rl100}"
@@ -24,6 +25,8 @@ dataset_path="${DATASET_PATH:-}"
 action_steps="${ACTION_STEPS:-4}"
 n_obs_steps="${N_OBS_STEPS:-3}"
 horizon="${HORIZON:-6}"
+arm_action_dims="${ARM_ACTION_DIMS:-7}"
+gripper_detach_encoder="${GRIPPER_DETACH_ENCODER:-False}"
 
 cd "$(dirname "$0")/../../../.."
 cd RL-100
@@ -46,6 +49,10 @@ fi
 expected_horizon=$((action_steps + n_obs_steps - 1))
 if ! [[ "${horizon}" =~ ^[1-9][0-9]*$ ]] || [ "${horizon}" -ne "${expected_horizon}" ]; then
   echo "HORIZON必须等于N_OBS_STEPS+ACTION_STEPS-1=${expected_horizon}，当前为: ${horizon}" >&2
+  exit 2
+fi
+if [ "${arm_action_dims}" != "6" ] && [ "${arm_action_dims}" != "7" ]; then
+  echo "ARM_ACTION_DIMS只能是6或7，当前为: ${arm_action_dims}" >&2
   exit 2
 fi
 
@@ -89,6 +96,12 @@ python train.py --config-name=rl100_3d_epsilon.yaml \
   +policy.gripper_loss_weight=1.0 \
   +policy.gripper_head_hidden_dim=256 \
   +policy.gripper_head_dropout=0.1 \
+  +policy.gripper_detach_encoder="${gripper_detach_encoder}" \
+  +task.dataset.action_dims="${arm_action_dims}" \
+  +task.norm_dataset.action_dims="${arm_action_dims}" \
+  +task.critic_dataset.action_dims="${arm_action_dims}" \
+  +task.scale_dataset.action_dims="${arm_action_dims}" \
+  task.shape_meta.action.shape="[${arm_action_dims}]" \
   training.num_epochs=600 \
   task.env_runner=null \
   "${dataset_overrides[@]}"

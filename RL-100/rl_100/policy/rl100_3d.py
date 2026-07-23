@@ -79,6 +79,7 @@ class RL1003D(BasePolicy):
             gripper_loss_weight: float = 1.0,
             gripper_head_hidden_dim: int = 256,
             gripper_head_dropout: float = 0.1,
+            gripper_detach_encoder: bool = False,
             # flow matching parameters
             flow_noise_scheduler=None,
             flow_inference_steps: int = 10,
@@ -104,6 +105,7 @@ class RL1003D(BasePolicy):
         self.use_gripper_head = use_gripper_head
         self.gripper_horizon = gripper_horizon
         self.gripper_loss_weight = gripper_loss_weight
+        self.gripper_detach_encoder = gripper_detach_encoder
         self.is_flow = (scheduler_type == 'flow')
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
@@ -831,7 +833,8 @@ class RL1003D(BasePolicy):
             raise KeyError(f'use_gripper_head=True，但batch缺少字段: {missing}')
 
         target = batch['gripper_target'].to(nobs_features.dtype)
-        logits = self.gripper_head(nobs_features.reshape(target.shape[0], -1))
+        gripper_features = nobs_features.detach() if self.gripper_detach_encoder else nobs_features
+        logits = self.gripper_head(gripper_features.reshape(target.shape[0], -1))
         valid = batch['gripper_valid_mask'].to(logits.dtype)
         event_weight = batch['gripper_event_weight'].to(logits.dtype)
         if logits.shape != target.shape:

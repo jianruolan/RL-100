@@ -162,7 +162,11 @@ def extract_policy_outputs(
 ) -> tuple[np.ndarray, np.ndarray]:
     """提取关节chunk和夹爪概率；明确丢弃diffusion的第7维控制值。"""
 
-    chunk7 = base.extract_action_chunk(output, expected_steps=expected_action_steps)
+    chunk = base.extract_action_chunk(output, expected_steps=expected_action_steps)
+    if chunk.shape[-1] not in (6, 7):
+        raise RuntimeError(
+            f"arm-only夹爪策略动作维度应为6或7，实际为{chunk.shape[-1]}"
+        )
     if "gripper_prob" not in output:
         raise RuntimeError(
             "策略没有返回gripper_prob；请确认使用新任务配置和含gripper_head.pt的权重"
@@ -175,7 +179,7 @@ def extract_policy_outputs(
     probabilities = probabilities[0].astype(np.float32)
     if not np.all(np.isfinite(probabilities)):
         raise RuntimeError("gripper_prob包含NaN/Inf")
-    return chunk7, probabilities
+    return chunk, probabilities
 
 
 def compute_training_stats(dataset) -> contact.TrainingStats:
@@ -290,7 +294,10 @@ def offline_smoke(dataset, policy, device, use_cm, n_action_steps, gripper_horiz
     )
     decision = decoder.update(probabilities)
     print(f"[offline-smoke] 关节chunk shape={chunk[:, :6].shape}", flush=True)
-    print(f"[offline-smoke] diffusion第7维={np.round(chunk[:, 6], 4)}（不下发）", flush=True)
+    if chunk.shape[-1] == 7:
+        print(f"[offline-smoke] diffusion第7维={np.round(chunk[:, 6], 4)}（不下发）", flush=True)
+    else:
+        print("[offline-smoke] arm-only diffusion为6维，无第7维夹爪动作", flush=True)
     print(f"[offline-smoke] p_open={np.round(probabilities, 4)}", flush=True)
     print(f"[offline-smoke] score={decision.score:.4f}, event={decision.event}", flush=True)
 
@@ -394,8 +401,8 @@ def main() -> None:
     )
     if not bool(getattr(policy, "use_gripper_head", False)) or policy.gripper_head is None:
         raise RuntimeError("所选权重没有启用独立夹爪分类头")
-    if list(cfg.shape_meta.obs.agent_pos.shape) != [7] or list(cfg.shape_meta.action.shape) != [7]:
-        raise RuntimeError("当前脚本只支持7维Piper pick-and-place配置")
+    if list(cfg.shape_meta.obs.agent_pos.shape) != [7] or list(cfg.shape_meta.action.shape) not in ([6], [7]):
+        raise RuntimeError("当前脚本只支持agent_pos=7维、action=6或7维Piper配置")
     if getattr(dataset, "action_key", None) != "policy_action":
         raise RuntimeError("数据集没有使用policy_action，拒绝把旧夹爪宽度权重用于本脚本")
 
@@ -640,9 +647,9 @@ def main() -> None:
                 elif decision.event == "open":
                     desired_gripper_width = args.open_width_m
 
-            predicted7 = active_chunk[chunk_step]
+            predicted_arm = active_chunk[chunk_step]
             joint_target, warnings = safe_joint_target(
-                predicted7[:6], state[:6], stats, args
+                predicted_arm[:6], state[:6], stats, args
             )
             if decision is not None and decision.event in {
                 "close_blocked", "open_blocked"
@@ -667,7 +674,9 @@ def main() -> None:
                 "host_time": time.time(),
                 "state": state.tolist(),
                 "predicted_joint_chunk": active_chunk[:, :6].tolist(),
-                "diffusion_gripper_state_chunk": active_chunk[:, 6].tolist(),
+                "diffusion_gripper_state_chunk": (
+                    active_chunk[:, 6].tolist() if active_chunk.shape[-1] == 7 else None
+                ),
                 "gripper_prob": active_probabilities.tolist(),
                 "gripper_score": None if decision is None else decision.score,
                 "gripper_event": None if decision is None else decision.event,
