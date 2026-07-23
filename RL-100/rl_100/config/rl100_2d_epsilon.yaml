@@ -36,7 +36,9 @@ clip_std_min: 0.0067
 clip_std_max: null
 action_norm: True
 vec_env_rng_align: False
-env_num: ${task.env_runner.env_num}
+# 纯离线真机数据没有env_runner；没有评估器时使用单环境占位值，避免
+# Hydra在解析配置阶段访问 null.env_num。
+env_num: ${oc.select:task.env_runner.env_num,1}
 with_pointcloud: True
 encoder_output_dim: 64
 only_bc: False
@@ -281,6 +283,30 @@ encoders:
     recon_loss_weight: 0.05
     kl_loss_weight: 1.0
     kl_beta: 1e-4
+
+  # RGB-D专用ImageNet ResNet18。DP3Encoder_with2D会把预训练RGB首层扩为4通道，
+  # 第4通道使用固定范围量化的D435深度。
+  resnet18_rgbd:
+    _target_: rl_100.model.vision.pointnet_extractor.DP3Encoder_with2D
+    observation_space:
+      image: ${shape_meta.obs.image.shape}
+      point_cloud: ${shape_meta.obs.point_cloud.shape}
+      agent_pos: ${shape_meta.obs.agent_pos.shape}
+    img_crop_shape: ${task.crop_shape}
+    out_channel: ${policy.encoder_output_dim}
+    state_mlp_hidden_dim: ${policy.encoder_hidden_dim}
+    state_mlp_activation_fn: ${policy.act}
+    pointcloud_encoder_cfg: ${policy.pointcloud_encoder_cfg}
+    use_pc_color: false
+    pointnet_type: pointnet
+    feature_type: 2D
+    model_name: resnet_18
+    use_agent_pos: ${use_agent_pos}
+    integrate_strategy: ${policy.integrate_strategy}
+    use_pretrained_2DEncoder: true
+    img_shape: ${policy.img_shape}
+    use_visual: true
+    mlp_depth: ${policy.encoder_depth}
     
   vit:
     _target_: rl_100.model.vision.encoder.EncoderMultiViewVisionTransformer

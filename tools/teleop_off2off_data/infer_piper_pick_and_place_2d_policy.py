@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Piper pick-and-place 2D RGB policy 的安全推理入口。
+"""Piper pick-and-place 2D RGB/RGB-D policy 的安全推理入口。
 
-训练 Zarr 和模型都使用 84x84 RGB，由 ``DP3Encoder_with2D`` 内部的
-``DrQEncoder([3,84,84], 32)`` 提取特征，不经过 R3M，也不上采样到 224。
+RGB实验使用84x84 DrQ；RGB-D实验使用4x224x224 ImageNet ResNet18，
+第4通道是按固定深度范围量化的D435深度。
 state/action 是 7 维，chunk 长度从权重配置读取（当前实验为 3/6/4）。
 
 默认 shadow 模式不发送动作。执行模式必须显式传 ``--execute`` 并确认短语；
@@ -53,6 +53,50 @@ def preprocess_rgb(frame: dict[str, Any]) -> np.ndarray:
     rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
     # Zarr 转换脚本的输入已经是 RGB，resize 后转 CHW；DrQ直接接收84x84。
     return resize_rgb_to_chw(rgb, size=84)
+
+
+def preprocess_rgbd(frame: dict[str, Any]) -> np.ndarray:
+    color_bgr = np.asarray(frame["color"])
+    depth_mm = np.asarray(frame["depth"])
+    if color_bgr.shape != (480, 640, 3) or depth_mm.shape != (480, 640):
+        raise RuntimeError(f"D435i RGB-D shape异常: rgb={color_bgr.shape}, depth={depth_mm.shape}")
+    rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
+
+    # 与新RGB-D训练集完全一致：640x480按比例缩到224x168，再在上下各补28像素。
+    # 不能直接拉伸到224x224，否则真机中的物体几何比例会偏离训练分布。
+    def letterbox(image: np.ndarray, interpolation: int) -> np.ndarray:
+        height, width = image.shape[:2]
+        scale = min(224 / width, 224 / height)
+        resized_width = max(1, int(round(width * scale)))
+        resized_height = max(1, int(round(height * scale)))
+        resized = cv2.resize(
+            image, (resized_width, resized_height), interpolation=interpolation
+        )
+        output_shape = (224, 224) + (() if image.ndim == 2 else (image.shape[2],))
+        output = np.zeros(output_shape, dtype=image.dtype)
+        x0 = (224 - resized_width) // 2
+        y0 = (224 - resized_height) // 2
+        output[y0:y0 + resized_height, x0:x0 + resized_width] = resized
+        return output
+
+    rgb_chw = letterbox(rgb, cv2.INTER_AREA)
+    depth_m = depth_mm.astype(np.float32) * 0.001
+    valid = np.isfinite(depth_m) & (depth_m >= 0.1) & (depth_m <= 2.0)
+    depth = np.zeros_like(depth_m, dtype=np.float32)
+    depth[valid] = (depth_m[valid] - 0.1) / 1.9
+    depth = letterbox(
+        np.rint(np.clip(depth, 0, 1) * 255).astype(np.uint8),
+        cv2.INTER_NEAREST,
+    )
+    return np.concatenate([np.transpose(rgb_chw, (2, 0, 1)), depth[None]], axis=0)
+
+
+def preprocess_frame(frame: dict[str, Any], image_shape: list[int]) -> np.ndarray:
+    if image_shape == [3, 84, 84]:
+        return preprocess_rgb(frame)
+    if image_shape == [4, 224, 224]:
+        return preprocess_rgbd(frame)
+    raise RuntimeError(f"不支持的2D图像输入: {image_shape}")
 
 
 def build_rgb_obs(history: deque[dict[str, np.ndarray]], device: torch.device) -> dict[str, torch.Tensor]:
@@ -118,12 +162,13 @@ def main():
     cfg, dataset, policy, use_cm = common.load_policy_and_dataset(args.output_dir, args.policy_subdir, args.device)
     if list(cfg.shape_meta.obs.agent_pos.shape) != [7] or list(cfg.shape_meta.action.shape) != [7]:
         raise RuntimeError(f"配置不是7D：agent_pos={cfg.shape_meta.obs.agent_pos.shape}, action={cfg.shape_meta.action.shape}")
-    if list(cfg.shape_meta.obs.image.shape) != [3, 84, 84]:
-        raise RuntimeError(f"Zarr/policy图像输入必须为[3,84,84]，实际为{cfg.shape_meta.obs.image.shape}")
-    if str(cfg.encoder_type).lower() != "drq":
+    image_shape = list(cfg.shape_meta.obs.image.shape)
+    if image_shape not in ([3, 84, 84], [4, 224, 224]):
+        raise RuntimeError(f"Zarr/policy图像输入必须为[3,84,84]或[4,224,224]，实际为{image_shape}")
+    expected_encoder = "drq" if image_shape == [3, 84, 84] else "resnet18_rgbd"
+    if str(cfg.encoder_type).lower() != expected_encoder:
         raise RuntimeError(
-            f"该推理脚本要求encoder_type=drq，当前为{cfg.encoder_type}；"
-            "请勿把旧R3M实验误当作DrQEncoder(84)加载"
+            f"该推理脚本要求encoder_type={expected_encoder}，当前为{cfg.encoder_type}"
         )
     n_obs_steps = int(cfg.n_obs_steps)
     n_action_steps = int(cfg.n_action_steps)
@@ -165,7 +210,7 @@ def main():
         for _ in range(n_obs_steps):
             state, _, _ = reader.read()
             frame = camera.get_frame(require_pc=False)
-            history.append({"agent_pos": state, "image": preprocess_rgb(frame)})
+            history.append({"agent_pos": state, "image": preprocess_frame(frame, image_shape)})
             time.sleep(1.0 / args.rate)
         last_state = history[-1]["agent_pos"].copy()
         print("[模式]", "真机执行" if args.execute else "影子模式（不下发）", flush=True)
@@ -215,7 +260,7 @@ def main():
                 raise RuntimeError("Piper夹爪反馈超过允许时间未更新")
             last_joint_ts, last_grip_ts = joint_ts, grip_ts
             frame = camera.get_frame(require_pc=False)
-            history.append({"agent_pos": state, "image": preprocess_rgb(frame)})
+            history.append({"agent_pos": state, "image": preprocess_frame(frame, image_shape)})
             chunk_step = step % args.chunk_exec_steps
             ran_inference = chunk_step == 0 or active_chunk is None
             if ran_inference:
@@ -252,7 +297,7 @@ def main():
         if not log_path.is_absolute():
             log_path = TRAIN_ROOT / log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "rate_hz": args.rate, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "image_shape": [3,84,84], "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "rate_hz": args.rate, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "image_shape": image_shape, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[日志] 已保存: {log_path.resolve()}", flush=True)
 
 

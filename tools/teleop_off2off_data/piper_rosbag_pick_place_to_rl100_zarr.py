@@ -194,6 +194,36 @@ def resize_rgb_to_chw(image_rgb: np.ndarray, size: int, mode: str) -> np.ndarray
     return np.ascontiguousarray(np.transpose(out, (2, 0, 1)))
 
 
+def resize_depth_to_chw_uint8(
+    depth_raw: np.ndarray,
+    size: int,
+    mode: str,
+    min_depth_m: float,
+    max_depth_m: float,
+) -> np.ndarray:
+    """把16UC1深度按固定物理范围量化为RGB-D的第4个uint8通道。"""
+    depth_m = depth_raw.astype(np.float32) * 0.001
+    valid = np.isfinite(depth_m) & (depth_m >= min_depth_m) & (depth_m <= max_depth_m)
+    normalized = np.zeros_like(depth_m, dtype=np.float32)
+    normalized[valid] = (depth_m[valid] - min_depth_m) / (max_depth_m - min_depth_m)
+    depth_u8 = np.rint(np.clip(normalized, 0.0, 1.0) * 255.0).astype(np.uint8)
+    if mode == "stretch":
+        out = cv2.resize(depth_u8, (size, size), interpolation=cv2.INTER_NEAREST)
+    elif mode == "letterbox":
+        height, width = depth_u8.shape
+        scale = min(size / width, size / height)
+        resized_width = max(1, int(round(width * scale)))
+        resized_height = max(1, int(round(height * scale)))
+        resized = cv2.resize(depth_u8, (resized_width, resized_height), interpolation=cv2.INTER_NEAREST)
+        out = np.zeros((size, size), dtype=np.uint8)
+        top = (size - resized_height) // 2
+        left = (size - resized_width) // 2
+        out[top : top + resized_height, left : left + resized_width] = resized
+    else:
+        raise ValueError(mode)
+    return out[None]
+
+
 def depth_to_point_cloud(
     depth_raw: np.ndarray,
     k: np.ndarray,
@@ -494,7 +524,15 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
 
             states.append(np.r_[state_joint8[:6], float(state_grip[0])])
             actions.append(np.r_[np.asarray(command, dtype=np.float64) * MDEG_TO_RAD, float(state_grip[0])])
-            images.append(resize_rgb_to_chw(rgb, args.image_size, args.image_resize_mode))
+            rgb_chw = resize_rgb_to_chw(rgb, args.image_size, args.image_resize_mode)
+            if args.rgbd:
+                depth_chw = resize_depth_to_chw_uint8(
+                    depth, args.image_size, args.image_resize_mode,
+                    args.min_depth_m, args.max_depth_m,
+                )
+                images.append(np.concatenate([rgb_chw, depth_chw], axis=0))
+            else:
+                images.append(rgb_chw)
             point_clouds.append(
                 depth_to_point_cloud(
                     depth,
@@ -681,6 +719,12 @@ def write_zarr(episodes: list[dict[str, np.ndarray]], reports: list[dict[str, An
                 "output_layout": "CHW",
                 "output_size": [args.image_size, args.image_size],
                 "resize_mode": args.image_resize_mode,
+                "channels": "RGBD" if args.rgbd else "RGB",
+                "depth_encoding": (
+                    "uint8: round(clip((depth_m-min_depth_m)/(max_depth_m-min_depth_m),0,1)*255), "
+                    "invalid/out-of-range=0"
+                    if args.rgbd else None
+                ),
             },
             "source_manifest": reports,
         }
@@ -781,6 +825,7 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=None, help="仅转换前 N 条成功轨迹，用于 smoke test")
     parser.add_argument("--image-size", type=int, default=84)
     parser.add_argument("--image-resize-mode", choices=["stretch", "letterbox"], default="stretch")
+    parser.add_argument("--rgbd", action="store_true", help="将深度量化后作为img的第4通道")
     parser.add_argument("--num-points", type=int, default=512)
     parser.add_argument("--min-depth-m", type=float, default=0.1)
     parser.add_argument("--max-depth-m", type=float, default=2.0)
@@ -837,6 +882,7 @@ def main() -> None:
         "configuration": {
             "image_size": args.image_size,
             "image_resize_mode": args.image_resize_mode,
+            "rgbd": args.rgbd,
             "num_points": args.num_points,
             "min_depth_m": args.min_depth_m,
             "max_depth_m": args.max_depth_m,

@@ -702,7 +702,8 @@ class DP3Encoder_with2D(nn.Module):
         self.use_agent_pos = use_agent_pos
         self.use_visual = use_visual
         self.use_pretrained_2DEncoder = use_pretrained_2DEncoder
-        img_shape = img_shape
+        self.img_shape = list(img_shape)
+        self.image_normalize = None
 
         self.use_imagined_robot = self.imagination_key in observation_space.keys()
         self.point_cloud_shape = observation_space[self.point_cloud_key]
@@ -722,7 +723,35 @@ class DP3Encoder_with2D(nn.Module):
             if feature_type == '2D' or feature_type == '2D3D':
                 if use_pretrained_2DEncoder:
                     if model_name == 'resnet_18':
-                        self.encoder2D, self.image_normalize = get_resnet('resnet18', weights='IMAGENET1K_V1')
+                        self.encoder2D = get_resnet('resnet18', weights='IMAGENET1K_V1')
+                        image_channels = int(self.img_shape[0])
+                        if image_channels not in (3, 4):
+                            raise ValueError(f'ImageNet ResNet18仅支持RGB/RGB-D，当前通道数={image_channels}')
+                        if image_channels == 4:
+                            old_conv = self.encoder2D.conv1
+                            new_conv = nn.Conv2d(
+                                4, old_conv.out_channels,
+                                kernel_size=old_conv.kernel_size,
+                                stride=old_conv.stride,
+                                padding=old_conv.padding,
+                                bias=False,
+                            )
+                            with torch.no_grad():
+                                new_conv.weight[:, :3].copy_(old_conv.weight)
+                                new_conv.weight[:, 3:4].copy_(
+                                    old_conv.weight.mean(dim=1, keepdim=True)
+                                )
+                            self.encoder2D.conv1 = new_conv
+                        mean = [0.485, 0.456, 0.406] + ([0.5] if image_channels == 4 else [])
+                        std = [0.229, 0.224, 0.225] + ([0.25] if image_channels == 4 else [])
+                        self.register_buffer(
+                            'image_mean', torch.tensor(mean).view(1, -1, 1, 1),
+                            persistent=False,
+                        )
+                        self.register_buffer(
+                            'image_std', torch.tensor(std).view(1, -1, 1, 1),
+                            persistent=False,
+                        )
                         if out_channel != 512:
                             self.trunk = nn.Sequential(nn.Linear(512, out_channel),
                                                 # nn.LayerNorm(out_channel), 
@@ -803,11 +832,20 @@ class DP3Encoder_with2D(nn.Module):
         if self.use_visual:
             if self.feature_type == '2D' or self.feature_type == '2D3D':
                 img = observations[self.rgb_image_key]
-                # import pdb; pdb.set_trace()
-                if img.shape[1] != 3:
+                expected_channels = self.img_shape[0]
+                if img.shape[1] != expected_channels and img.shape[-1] == expected_channels:
                     img = einops.rearrange(img, "b h w c -> b c h w")
-                if self.model_name == 'resnet_18' or self.model_name == 'resnet_50' or self.model_name == 'clip':
-                    img = self.image_normalize(img/255)
+                if img.shape[1] != expected_channels:
+                    raise ValueError(
+                        f'图像通道数不匹配: expected={expected_channels}, got={tuple(img.shape)}'
+                    )
+                img = img.float()
+                if img.max() >= 10:
+                    img = img / 255.0
+                if self.model_name == 'resnet_18' and self.use_pretrained_2DEncoder:
+                    img = (img - self.image_mean) / self.image_std
+                elif self.model_name == 'resnet_50' or self.model_name == 'clip':
+                    img = self.image_normalize(img)
 
                 if self.model_name == 'clip':
                     rgb_features = self.encoder2D(img)
