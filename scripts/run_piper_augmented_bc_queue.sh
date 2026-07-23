@@ -7,6 +7,7 @@ log_dir="${repo_root}/RL-100/data/outputs/piper_augmented_bc_queue"
 mkdir -p "${log_dir}"
 queue_log="${log_dir}/queue.log"
 target_epoch="$(date -d "$(date +%F) 23:30:00" +%s)"
+gpu_id="${GPU_ID:-0}"
 
 log() {
   echo "[$(date '+%F %T')] $*" | tee -a "${queue_log}"
@@ -26,17 +27,35 @@ wait_until_allowed() {
 
 wait_for_gpu() {
   while true; do
-    if ! nvidia-smi >/dev/null 2>&1; then
+    if ! nvidia-smi -i "${gpu_id}" >/dev/null 2>&1; then
       log "nvidia-smi暂不可用，30分钟后重试"
       sleep 1800
       continue
     fi
-    active="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | sed '/^[[:space:]]*$/d')"
+    # GNOME等显示服务偶尔会被列为compute app，但实际显存为0 MiB。
+    # 只将显存大于0 MiB（或无法解析显存）的进程视作真正GPU占用。
+    active="$(
+      nvidia-smi -i "${gpu_id}" \
+        --query-compute-apps=pid,process_name,used_gpu_memory \
+        --format=csv,noheader 2>/dev/null |
+      awk -F',' '
+        {
+          memory=$3
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", memory)
+          gsub(/[[:space:]]*MiB$/, "", memory)
+          if (memory ~ /^[0-9]+$/) {
+            if (memory + 0 > 0) print $0
+          } else {
+            print $0
+          }
+        }
+      '
+    )"
     if [ -z "${active}" ]; then
-      log "GPU空闲"
+      log "GPU ${gpu_id}空闲"
       return 0
     fi
-    log "GPU仍有计算进程PID=${active//$'\n'/,}，30分钟后重试"
+    log "GPU ${gpu_id}仍有计算进程=${active//$'\n'/;}，30分钟后重试"
     sleep 1800
   done
 }
@@ -67,9 +86,9 @@ wait_until_allowed
 cd "${repo_root}"
 
 run_with_resume "3d_chunk4_bc" \
-  "GPU_ID=0 RUN_DIR=data/outputs/piper_pick_and_place_augmented_chunk4_seed42 bash scripts/Diffusion/Offline/3D/train_policy_piper_pick_and_place_augmented.sh rl100 piper_pick_and_place_augmented chunk4-bc 42"
+  "GPU_ID=${gpu_id} RUN_DIR=data/outputs/piper_pick_and_place_augmented_chunk4_seed42 bash scripts/Diffusion/Offline/3D/train_policy_piper_pick_and_place_augmented.sh rl100 piper_pick_and_place_augmented chunk4-bc 42"
 
 run_with_resume "2d_rgbd_resnet18_chunk4_bc" \
-  "GPU_ID=0 BATCH_SIZE=32 RUN_DIR=data/outputs/piper_pick_and_place_augmented_rgbd_resnet18_chunk4_seed42 bash scripts/Diffusion/Offline/2D/train_policy_piper_pick_and_place_rgbd.sh rl100 piper_pick_and_place_augmented_rgbd rgbd-resnet18-chunk4-bc 42"
+  "GPU_ID=${gpu_id} BATCH_SIZE=32 RUN_DIR=data/outputs/piper_pick_and_place_augmented_rgbd_resnet18_chunk4_seed42 bash scripts/Diffusion/Offline/2D/train_policy_piper_pick_and_place_rgbd.sh rl100 piper_pick_and_place_augmented_rgbd rgbd-resnet18-chunk4-bc 42"
 
 log "两个BC实验均已完成"

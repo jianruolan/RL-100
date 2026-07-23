@@ -74,6 +74,9 @@ def preprocess_rgbd(frame: dict[str, Any]) -> np.ndarray:
         )
         output_shape = (224, 224) + (() if image.ndim == 2 else (image.shape[2],))
         output = np.zeros(output_shape, dtype=image.dtype)
+        if image.ndim == 3:
+            # 转换脚本用ImageNet均值填RGB边框，归一化后边框接近0。
+            output[...] = np.array([123, 116, 104], dtype=image.dtype)
         x0 = (224 - resized_width) // 2
         y0 = (224 - resized_height) // 2
         output[y0:y0 + resized_height, x0:x0 + resized_width] = resized
