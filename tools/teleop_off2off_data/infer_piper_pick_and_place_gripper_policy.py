@@ -348,7 +348,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--consecutive", type=int, default=2)
     parser.add_argument("--cooldown-frames", type=int, default=4)
     parser.add_argument("--window-start", type=int, default=0)
-    parser.add_argument("--window-end", type=int, default=8)
+    parser.add_argument(
+        "--window-end",
+        type=int,
+        default=None,
+        help="默认自动取min(8, gripper_horizon)；单帧分类头自动使用1。",
+    )
     parser.add_argument(
         "--gripper-event-max-joint-speed-rad-s",
         type=float,
@@ -386,7 +391,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("夹爪阈值必须满足0<=close<open<=1")
     if args.consecutive < 1 or args.cooldown_frames < 0:
         raise ValueError("consecutive必须为正，cooldown-frames不能为负")
-    if args.window_start < 0 or args.window_end <= args.window_start:
+    if args.window_start < 0 or (
+        args.window_end is not None and args.window_end <= args.window_start
+    ):
         raise ValueError("夹爪概率窗口必须满足0<=start<end")
     if not args.close_width_m < args.initial_open_threshold_m < args.open_width_m:
         raise ValueError("initial-open-threshold-m必须位于close/open宽度之间")
@@ -410,6 +417,8 @@ def main() -> None:
     n_action_steps = int(cfg.n_action_steps)
     horizon = int(cfg.horizon)
     gripper_horizon = int(policy.gripper_horizon)
+    if args.window_end is None:
+        args.window_end = min(8, gripper_horizon)
     if horizon != n_obs_steps - 1 + n_action_steps:
         raise RuntimeError("horizon与n_obs_steps/n_action_steps不匹配")
     if args.chunk_exec_steps > n_action_steps:

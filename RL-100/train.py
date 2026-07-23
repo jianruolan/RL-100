@@ -677,6 +677,19 @@ class TrainDP3Workspace:
         self.offline_best_path = self.get_global_best_dir()
         self.offline_last_path = os.path.join(self.output_dir, 'last')
         # =============================== stage 1-1: end diffusion training ===============================
+        if getattr(self.cfg, 'stop_after_bc', False):
+            # ``only_bc``在旧代码中只表示额外保存BC权重，并不会停止后续阶段。
+            # 消融实验需要真正的BC-only模式：保存最终策略后，不初始化critic、
+            # dynamics，也不进入CM或offline RL。
+            self.unio4.set_policy(self.model)
+            self.unio4.set_old_policy()
+            bc_path = os.path.join(self.output_dir, 'bc')
+            os.makedirs(bc_path, exist_ok=True)
+            self.unio4.save(bc_path)
+            if cfg.checkpoint.save_ckpt:
+                self.save_checkpoint()
+            cprint(f'BC-only training complete. Policy saved to {bc_path}', 'green')
+            return
         if self.cfg.distill_phase == 'after_dp':
             self.distill2cm(train_dataloader, val_dataloader, wandb_run, env_runner, phase=self.cfg.distill_phase)
         # =============================== stage 1-3: set for critic and dynamics training ===============================

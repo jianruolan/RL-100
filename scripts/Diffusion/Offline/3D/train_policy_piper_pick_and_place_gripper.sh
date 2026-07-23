@@ -8,7 +8,7 @@
 # 默认执行：BC -> CM蒸馏 -> Q/Value -> dynamics -> offline RL。
 # 可用环境变量：GPU_ID、OFFLINE、RESUME、RUN_DIR、DATASET_PATH、
 # ACTION_STEPS、N_OBS_STEPS、HORIZON、DISTILL_PHASE、ARM_ACTION_DIMS、
-# GRIPPER_DETACH_ENCODER。
+# GRIPPER_DETACH_ENCODER、GRIPPER_HORIZON、BC_ONLY。
 set -euo pipefail
 
 alg_name="${1:-rl100}"
@@ -27,6 +27,8 @@ n_obs_steps="${N_OBS_STEPS:-3}"
 horizon="${HORIZON:-6}"
 arm_action_dims="${ARM_ACTION_DIMS:-7}"
 gripper_detach_encoder="${GRIPPER_DETACH_ENCODER:-False}"
+gripper_horizon="${GRIPPER_HORIZON:-12}"
+bc_only="${BC_ONLY:-False}"
 
 cd "$(dirname "$0")/../../../.."
 cd RL-100
@@ -55,6 +57,10 @@ if [ "${arm_action_dims}" != "6" ] && [ "${arm_action_dims}" != "7" ]; then
   echo "ARM_ACTION_DIMS只能是6或7，当前为: ${arm_action_dims}" >&2
   exit 2
 fi
+if ! [[ "${gripper_horizon}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GRIPPER_HORIZON必须是正整数，当前为: ${gripper_horizon}" >&2
+  exit 2
+fi
 
 dataset_overrides=()
 if [ -n "${dataset_path}" ]; then
@@ -77,6 +83,7 @@ python train.py --config-name=rl100_3d_epsilon.yaml \
   logging.mode=online \
   use_wandb=True \
   checkpoint.save_ckpt=True \
+  +stop_after_bc="${bc_only}" \
   training.resume="${resume}" \
   distill_phase="${distill_phase}" \
   horizon="${horizon}" n_obs_steps="${n_obs_steps}" n_action_steps="${action_steps}" \
@@ -92,7 +99,7 @@ python train.py --config-name=rl100_3d_epsilon.yaml \
   policy.use_vib=True \
   policy.use_recon=True \
   +policy.use_gripper_head=True \
-  +policy.gripper_horizon=12 \
+  +policy.gripper_horizon="${gripper_horizon}" \
   +policy.gripper_loss_weight=1.0 \
   +policy.gripper_head_hidden_dim=256 \
   +policy.gripper_head_dropout=0.1 \
@@ -101,6 +108,10 @@ python train.py --config-name=rl100_3d_epsilon.yaml \
   +task.norm_dataset.action_dims="${arm_action_dims}" \
   +task.critic_dataset.action_dims="${arm_action_dims}" \
   +task.scale_dataset.action_dims="${arm_action_dims}" \
+  task.dataset.gripper_horizon="${gripper_horizon}" \
+  task.norm_dataset.gripper_horizon="${gripper_horizon}" \
+  task.critic_dataset.gripper_horizon="${gripper_horizon}" \
+  task.scale_dataset.gripper_horizon="${gripper_horizon}" \
   task.shape_meta.action.shape="[${arm_action_dims}]" \
   training.num_epochs=600 \
   task.env_runner=null \
