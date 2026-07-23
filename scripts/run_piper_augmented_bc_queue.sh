@@ -8,6 +8,7 @@ mkdir -p "${log_dir}"
 queue_log="${log_dir}/queue.log"
 target_epoch="$(date -d "$(date +%F) 23:30:00" +%s)"
 gpu_id="${GPU_ID:-0}"
+gpu_poll_seconds="${GPU_POLL_SECONDS:-60}"
 
 log() {
   echo "[$(date '+%F %T')] $*" | tee -a "${queue_log}"
@@ -28,8 +29,8 @@ wait_until_allowed() {
 wait_for_gpu() {
   while true; do
     if ! nvidia-smi -i "${gpu_id}" >/dev/null 2>&1; then
-      log "nvidia-smi暂不可用，30分钟后重试"
-      sleep 1800
+      log "nvidia-smi暂不可用，${gpu_poll_seconds}秒后重试"
+      sleep "${gpu_poll_seconds}"
       continue
     fi
     # GNOME等显示服务偶尔会被列为compute app，但实际显存为0 MiB。
@@ -55,8 +56,8 @@ wait_for_gpu() {
       log "GPU ${gpu_id}空闲"
       return 0
     fi
-    log "GPU ${gpu_id}仍有计算进程=${active//$'\n'/;}，30分钟后重试"
-    sleep 1800
+    log "GPU ${gpu_id}仍有计算进程=${active//$'\n'/;}，${gpu_poll_seconds}秒后重试"
+    sleep "${gpu_poll_seconds}"
   done
 }
 
