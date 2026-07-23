@@ -236,6 +236,30 @@ policy:
 
 # 定义不同的编码器配置
 encoders:
+  # 仓库原生 84x84 DrQ 视觉编码器。只有显式设置 encoder_type=drq 时启用，
+  # 不改变现有 resnet/R3M 和 vit 实验的默认行为。
+  drq:
+    _target_: rl_100.model.vision.pointnet_extractor.DP3Encoder_with2D
+    observation_space:
+      image: ${shape_meta.obs.image.shape}
+      point_cloud: ${shape_meta.obs.point_cloud.shape}
+      agent_pos: ${shape_meta.obs.agent_pos.shape}
+    img_crop_shape: ${task.crop_shape}
+    out_channel: ${policy.encoder_output_dim}
+    state_mlp_hidden_dim: ${policy.encoder_hidden_dim}
+    state_mlp_activation_fn: ${policy.act}
+    pointcloud_encoder_cfg: ${policy.pointcloud_encoder_cfg}
+    use_pc_color: false
+    pointnet_type: pointnet
+    feature_type: ${feature_type}
+    model_name: ${policy.stage1_model_name}
+    use_agent_pos: ${use_agent_pos}
+    integrate_strategy: ${policy.integrate_strategy}
+    use_pretrained_2DEncoder: false
+    img_shape: ${policy.img_shape}
+    use_visual: ${policy.use_visual}
+    mlp_depth: ${policy.encoder_depth}
+
   resnet:
     _target_: rl_100.model.vision.multi_image_obs_encoder.MultiImageObsEncoder
     shape_meta: ${shape_meta}
