@@ -498,12 +498,23 @@ class TrainDP3Workspace:
         latest_path = self.get_checkpoint_path(tag='latest')
         skip_diffusion_training = cfg.online and (self.cfg.training.resume == False)
         # ===============================stage 1-1: set for diffusion training ===============================
-        if not os.path.exists(latest_path) or self.cfg.training.resume == False or (self.cfg.off2off and not self.cfg.off2off_no_bc):
+        latest_exists = os.path.exists(latest_path)
+        resume_incomplete_bc = (
+            self.cfg.training.resume
+            and latest_exists
+            and self.epoch < cfg.training.num_epochs
+        )
+        if (not latest_exists or self.cfg.training.resume == False
+                or resume_incomplete_bc
+                or (self.cfg.off2off and not self.cfg.off2off_no_bc)):
             # VIB module beta kl anealling
             total_steps = cfg.training.num_epochs * len(train_dataloader)
             if hasattr(self.model.obs_encoder, 'beta_kl'):
                 target_beta_kl = self.model.obs_encoder.beta_kl
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            # 周期checkpoint在epoch末尾递增计数之前保存，因此意外中断后会
+            # 安全地重跑最近一个epoch，而不是把整个BC阶段误判为已经完成。
+            first_epoch = self.epoch if resume_incomplete_bc else 0
+            for local_epoch_idx in range(first_epoch, cfg.training.num_epochs):
                 # KL annealing
                 if cfg.kl_annealing and hasattr(self.model.obs_encoder, 'beta_kl'):
                     progress = local_epoch_idx / max(cfg.training.num_epochs - 1, 1)

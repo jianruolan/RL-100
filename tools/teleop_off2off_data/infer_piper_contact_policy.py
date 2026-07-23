@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import importlib.util
 import json
 import math
 import os
@@ -46,9 +47,15 @@ PYTORCH3D_ROOT = REPO_ROOT / "third_party/pytorch3d_simplified"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "data/outputs/piper_soft_block_contact_50_seed42"
 
 # 保证从任意工作目录启动时都能导入 RL-100 和 tools。
-for path in (str(REPO_ROOT), str(TRAIN_ROOT), str(PYTORCH3D_ROOT)):
+for path in (str(REPO_ROOT), str(TRAIN_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
+
+# 优先使用rl100_test环境中已安装、带编译扩展的PyTorch3D。仓库内的
+# simplified目录只作为没有安装PyTorch3D时的fallback；把它插到
+# sys.path最前面会遮蔽site-packages，并因缺少pytorch3d._C导致推理失败。
+if importlib.util.find_spec("pytorch3d") is None and str(PYTORCH3D_ROOT) not in sys.path:
+    sys.path.append(str(PYTORCH3D_ROOT))
 
 RAD_TO_RAW = 180.0 / math.pi * 1000.0
 RAW_TO_RAD = math.pi / 180.0 / 1000.0

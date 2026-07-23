@@ -178,14 +178,24 @@ def build_obs(history: deque[dict[str, np.ndarray]], device: torch.device) -> di
     }
 
 
-def extract_action_chunk(action_dict: dict[str, torch.Tensor], expected_steps: int = 4) -> np.ndarray:
+def extract_action_chunk(
+    action_dict: dict[str, torch.Tensor],
+    expected_steps: int = 4,
+    expected_dims: int = 7,
+) -> np.ndarray:
     if "action" not in action_dict:
         raise RuntimeError(f"predict_action() 没有 action，keys={list(action_dict)}")
     action = action_dict["action"].detach().cpu().numpy()
     if action.ndim == 2:
         action = action[None]
-    if action.ndim != 3 or action.shape[0] != 1 or action.shape[2] != 7:
-        raise RuntimeError(f"策略 action 应为 [1,{expected_steps},7]，实际为 {action.shape}")
+    if action.ndim != 3 or action.shape[0] != 1 or action.shape[2] not in (6, 7):
+        raise RuntimeError(
+            f"策略 action 应为 [1,{expected_steps},{expected_dims}]，实际为 {action.shape}"
+        )
+    if action.shape[2] != expected_dims:
+        raise RuntimeError(
+            f"策略 action 维度应为{expected_dims}，实际为 {action.shape[2]}"
+        )
     if action.shape[1] != expected_steps:
         raise RuntimeError(f"策略 chunk 长度应为 {expected_steps}，实际为 {action.shape[1]}")
     chunk = action[0].astype(np.float32)

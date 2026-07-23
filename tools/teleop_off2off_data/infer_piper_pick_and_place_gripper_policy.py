@@ -4,9 +4,11 @@
 动作约定：
 
 * diffusion ``action[..., :6]`` 是六关节绝对目标（rad）；
-* diffusion ``action[..., 6]`` 是训练用的0/1夹爪命令状态，仅记录诊断；
-* 真机夹爪由 ``gripper_prob`` 的未来12帧张开概率经过迟滞、连续确认、
-  冷却和状态锁存后控制，不能把0/1直接当成米制宽度发送给 SDK。
+* 7维消融中 ``action[..., 6]`` 是训练用的0/1夹爪命令状态，仅记录诊断；
+* 6维消融没有 diffusion 夹爪维度；两种消融的真机夹爪都由
+  ``gripper_prob`` 分类头控制；
+* 分类头可以输出单帧或未来多帧概率，统一经过迟滞、连续确认、冷却和
+  状态锁存，不能把0/1直接当成米制宽度发送给 SDK。
 
 默认仅运行 shadow mode。即使指定 ``--execute``，也只有再显式指定
 ``--allow-gripper-events``，分类头产生的开合事件才会发给真机。
@@ -162,7 +164,11 @@ def extract_policy_outputs(
 ) -> tuple[np.ndarray, np.ndarray]:
     """提取关节chunk和夹爪概率；明确丢弃diffusion的第7维控制值。"""
 
-    chunk = base.extract_action_chunk(output, expected_steps=expected_action_steps)
+    chunk = base.extract_action_chunk(
+        output,
+        expected_steps=expected_action_steps,
+        expected_dims=int(output["action"].shape[-1]),
+    )
     if chunk.shape[-1] not in (6, 7):
         raise RuntimeError(
             f"arm-only夹爪策略动作维度应为6或7，实际为{chunk.shape[-1]}"
@@ -306,6 +312,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--policy-subdir", choices=["best", "bc", "best_cm"], default="best")
+    parser.add_argument(
+        "--expected-action-dims",
+        type=int,
+        choices=[6, 7],
+        default=None,
+        help="消融入口用于防止误加载另一实验的权重。",
+    )
+    parser.add_argument(
+        "--expected-gripper-horizon",
+        type=int,
+        default=None,
+        help="要求夹爪头输出步数与实验配置一致。",
+    )
+    parser.add_argument(
+        "--require-gripper-detach",
+        action="store_true",
+        help="要求夹爪分类损失不反传到共享encoder。",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--offline-smoke", action="store_true")
     parser.add_argument("--can", default="can0")
@@ -417,6 +441,24 @@ def main() -> None:
     n_action_steps = int(cfg.n_action_steps)
     horizon = int(cfg.horizon)
     gripper_horizon = int(policy.gripper_horizon)
+    action_dims = int(cfg.shape_meta.action.shape[0])
+    if args.expected_action_dims is not None and action_dims != args.expected_action_dims:
+        raise RuntimeError(
+            f"权重动作维度为{action_dims}，但当前消融入口要求"
+            f"{args.expected_action_dims}维；请检查--output-dir"
+        )
+    if (
+        args.expected_gripper_horizon is not None
+        and gripper_horizon != args.expected_gripper_horizon
+    ):
+        raise RuntimeError(
+            f"夹爪头horizon={gripper_horizon}，但当前消融入口要求"
+            f"{args.expected_gripper_horizon}"
+        )
+    if args.require_gripper_detach and not bool(
+        getattr(policy, "gripper_detach_encoder", False)
+    ):
+        raise RuntimeError("当前消融入口要求gripper_detach_encoder=True")
     if args.window_end is None:
         args.window_end = min(8, gripper_horizon)
     if horizon != n_obs_steps - 1 + n_action_steps:
