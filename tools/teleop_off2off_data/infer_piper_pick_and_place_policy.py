@@ -207,6 +207,12 @@ def extract_action_chunk(
 
 def training_stats(dataset) -> dict[str, np.ndarray]:
     replay = dataset.replay_buffer
+    action_key = getattr(dataset, "action_key", "action")
+    if action_key not in replay:
+        raise RuntimeError(
+            f"数据集训练动作键 {action_key!r} 不在 replay buffer 中，"
+            f"可用键={list(replay.keys())}"
+        )
     state = np.asarray(replay["state"][:], dtype=np.float32)
     # Piper数据配置使用policy_action；不要硬编码成旧数据集的action键。
     action_key = str(getattr(dataset, "action_key", "action"))

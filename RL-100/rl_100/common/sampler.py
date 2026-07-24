@@ -1,6 +1,20 @@
 from typing import Optional
 import numpy as np
-import numba
+
+try:
+    import numba
+except Exception as exc:
+    # 部分系统环境中的 numba 与 coverage 版本不兼容，会在 import 阶段
+    # 抛出 AttributeError（例如 coverage.types.Tracer 不存在）。采样索引
+    # 逻辑本身不依赖 JIT；使用透明装饰器 fallback 仍可正常加载数据集。
+    class _NumbaFallback:
+        @staticmethod
+        def jit(*args, **kwargs):
+            if args and callable(args[0]) and len(args) == 1:
+                return args[0]
+            return lambda function: function
+
+    numba = _NumbaFallback()
 from rl_100.common.replay_buffer import ReplayBuffer
 
 
