@@ -162,7 +162,11 @@ class TrainDP3Workspace:
 
         # load pretrained 2D encoder if configured
         if getattr(cfg, 'use_pretrained_2DEncoder', False):
-            if 'channel' in cfg.policy.stage1_model_name:
+            # RGB-D ResNet18 is initialized directly from ImageNet in
+            # DP3Encoder_with2D.  It must not try to load the legacy VRL3
+            # stage-1 checkpoint (resnet6_32channel_checkpoint.pth.tar).
+            encoder_type = str(getattr(cfg, 'encoder_type', ''))
+            if 'channel' in cfg.policy.stage1_model_name and encoder_type != 'resnet18_rgbd':
                 print('load pretrained encoder')
                 self.model.obs_encoder.load_pretrained_encoder(
                     self.get_pretrained_model_path(cfg.policy.stage1_model_name), device=self.device)

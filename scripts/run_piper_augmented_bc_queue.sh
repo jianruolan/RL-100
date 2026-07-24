@@ -79,6 +79,13 @@ run_with_resume() {
     log "检测到${name} checkpoint=${checkpoint_path}，将从断点恢复"
   fi
   while true; do
+    # 只有真实存在checkpoint时才能开启resume；初始化阶段失败时目录可能
+    # 已创建但没有latest.ckpt，此时必须保持RESUME=False从干净状态重试。
+    if [ -n "${checkpoint_path}" ] && [ -f "${checkpoint_path}" ]; then
+      resume=True
+    else
+      resume=False
+    fi
     wait_for_gpu
     log "启动${name}，RESUME=${resume}"
     set +e
@@ -95,12 +102,20 @@ run_with_resume() {
   done
 }
 
-wait_until_allowed
+if [ "${SKIP_TIME_GATE:-False}" = "True" ]; then
+  log "SKIP_TIME_GATE=True，原始23:30启动门槛已满足"
+else
+  wait_until_allowed
+fi
 cd "${repo_root}"
 
-run_with_resume "3d_chunk4_bc" \
-  "PYTHON_BIN=${python_bin} GPU_ID=${gpu_id} RUN_DIR=data/outputs/piper_pick_and_place_augmented_chunk4_seed42 bash scripts/Diffusion/Offline/3D/train_policy_piper_pick_and_place_augmented.sh rl100 piper_pick_and_place_augmented chunk4-bc 42" \
-  "${repo_root}/RL-100/data/outputs/piper_pick_and_place_augmented_chunk4_seed42/checkpoints/latest.ckpt"
+if [ "${SKIP_3D:-False}" = "True" ]; then
+  log "SKIP_3D=True，跳过已完成的3D BC"
+else
+  run_with_resume "3d_chunk4_bc" \
+    "PYTHON_BIN=${python_bin} GPU_ID=${gpu_id} RUN_DIR=data/outputs/piper_pick_and_place_augmented_chunk4_seed42 bash scripts/Diffusion/Offline/3D/train_policy_piper_pick_and_place_augmented.sh rl100 piper_pick_and_place_augmented chunk4-bc 42" \
+    "${repo_root}/RL-100/data/outputs/piper_pick_and_place_augmented_chunk4_seed42/checkpoints/latest.ckpt"
+fi
 
 run_with_resume "2d_rgbd_resnet18_chunk4_bc" \
   "PYTHON_BIN=${python_bin} GPU_ID=${gpu_id} BATCH_SIZE=32 RUN_DIR=data/outputs/piper_pick_and_place_augmented_rgbd_resnet18_chunk4_seed42 bash scripts/Diffusion/Offline/2D/train_policy_piper_pick_and_place_rgbd.sh rl100 piper_pick_and_place_augmented_rgbd rgbd-resnet18-chunk4-bc 42" \
