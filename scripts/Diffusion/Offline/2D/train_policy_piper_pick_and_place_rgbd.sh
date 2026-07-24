@@ -10,6 +10,7 @@ run_dir="${RUN_DIR:-data/outputs/piper_pick_and_place_augmented_rgbd_resnet18_ch
 resume="${RESUME:-False}"
 dataset_path="${DATASET_PATH:-data/piper_pick_and_place_augmented_rgbd224.zarr}"
 python_bin="${PYTHON_BIN:-python}"
+checkpoint_every="${CHECKPOINT_EVERY:-10}"
 
 cd "$(dirname "$0")/../../../.."
 cd RL-100
@@ -23,6 +24,7 @@ export LD_LIBRARY_PATH="${MUJOCO_PY_MUJOCO_PATH}/bin:${MUJOCO_PY_MUJOCO_PATH}/li
   training.debug=False training.seed="${seed}" training.device=cuda:0 \
   exp_name="${task_name}-${alg_name}-${addition_info}" \
   logging.mode=online use_wandb=True checkpoint.save_ckpt=True \
+  training.checkpoint_every="${checkpoint_every}" \
   training.resume="${resume}" +stop_after_bc=True \
   horizon=6 n_obs_steps=3 n_action_steps=4 chunk_as_single_action=True \
   dynamics.prediction_mode=full only_bc=True offline=False online=False eval=False \
