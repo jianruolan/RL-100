@@ -21,10 +21,12 @@ import argparse
 import datetime
 import json
 import math
+import multiprocessing as mp
 import os
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -54,6 +56,230 @@ GRIPPER_LOWER_M = 0.0
 GRIPPER_UPPER_M = 0.07
 GRIPPER_RAW_PER_M = 1_000_000.0  # Piper GripperCtrl 单位是 0.001 mm
 GRIPPER_EFFORT = 1000
+
+
+def _piper_process_worker(conn, can_name: str, sdk_root: str | None) -> None:
+    """Own Piper SDK and its high-rate Python threads in a separate process."""
+
+    try:
+        # All Piper SDK threads inherit this affinity.  Reserve CPU 0 for CAN
+        # receive/parse work so CUDA launch threads are not preempted by the
+        # 200 Hz feedback stream on Thor's remaining cores.
+        if hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, {0})
+        sdk_path = Path(sdk_root) if sdk_root is not None else None
+        interface_cls = contact.import_piper_sdk(sdk_path)
+        piper = interface_cls(can_name)
+        conn.send(("ready", None))
+        while True:
+            request = conn.recv()
+            if request is None:
+                break
+            method_name, args, kwargs = request
+            try:
+                result = getattr(piper, method_name)(*args, **kwargs)
+                conn.send(("ok", result))
+            except BaseException:
+                conn.send(("error", traceback.format_exc()))
+    except BaseException:
+        try:
+            conn.send(("fatal", traceback.format_exc()))
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+class PiperProcessProxy:
+    """Synchronous Piper SDK proxy that keeps CAN parser threads off the GIL."""
+
+    def __init__(self, can_name: str, sdk_root: Path | None):
+        ctx = mp.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        self._conn = parent_conn
+        self._process = ctx.Process(
+            target=_piper_process_worker,
+            args=(child_conn, can_name, str(sdk_root) if sdk_root else None),
+            daemon=True,
+        )
+        self._process.start()
+        child_conn.close()
+        status, payload = self._conn.recv()
+        if status != "ready":
+            self.close()
+            raise RuntimeError(f"Piper 子进程启动失败:\n{payload}")
+
+    def __getattr__(self, method_name: str):
+        if method_name.startswith("_"):
+            raise AttributeError(method_name)
+
+        def call(*args, **kwargs):
+            self._conn.send((method_name, args, kwargs))
+            status, payload = self._conn.recv()
+            if status != "ok":
+                raise RuntimeError(
+                    f"Piper 子进程调用 {method_name} 失败:\n{payload}"
+                )
+            return payload
+
+        return call
+
+    def close(self) -> None:
+        conn = getattr(self, "_conn", None)
+        process = getattr(self, "_process", None)
+        if conn is not None:
+            try:
+                conn.send(None)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+            self._conn = None
+        if process is not None:
+            process.join(timeout=1.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+            self._process = None
+
+
+class LatestFrameCamera:
+    """Continuously capture RealSense frames and expose the newest complete one."""
+
+    def __init__(self, camera):
+        self._camera = camera
+        self._condition = threading.Condition()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._latest: dict[str, Any] | None = None
+        self._error: BaseException | None = None
+
+    def start(self) -> None:
+        self._camera.start()
+        self._thread = threading.Thread(
+            target=self._capture_loop,
+            name="realsense-latest-frame",
+            daemon=True,
+        )
+        self._thread.start()
+        self.get_frame(timeout=5.0)
+
+    def _capture_loop(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                frame = self._camera.get_frame(require_pc=False)
+                with self._condition:
+                    self._latest = frame
+                    self._condition.notify_all()
+        except BaseException as exc:
+            if not self._stop_event.is_set():
+                with self._condition:
+                    self._error = exc
+                    self._condition.notify_all()
+
+    def get_frame(self, require_pc: bool = False, timeout: float = 1.0):
+        if require_pc:
+            raise ValueError("LatestFrameCamera 仅缓存原始 RGB-D 帧")
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while self._latest is None and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("等待 RealSense 后台首帧超时")
+                self._condition.wait(remaining)
+            if self._error is not None:
+                raise RuntimeError("RealSense 后台采集失败") from self._error
+            return self._latest
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        try:
+            self._camera.stop()
+        finally:
+            if self._thread is not None:
+                self._thread.join(timeout=1.0)
+                self._thread = None
+
+
+class AsyncPolicyWorker:
+    """Run FP32 policy inference concurrently and keep only the newest request."""
+
+    def __init__(self, policy, device, use_cm: bool, initial_noise):
+        self._policy = policy
+        self._device = device
+        self._use_cm = use_cm
+        self._initial_noise = initial_noise
+        self._condition = threading.Condition()
+        self._pending = None
+        self._latest = None
+        self._next_request_id = 0
+        self._stop = False
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run, name="cuda-policy-worker", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def submit(self, obs, control_step: int) -> int:
+        with self._condition:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            # Drop an observation that has not started yet; executing stale
+            # observations is worse than using the most recent complete action.
+            self._pending = (request_id, int(control_step), obs)
+            self._condition.notify()
+            return request_id
+
+    def latest(self):
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("异步策略推理失败") from self._error
+            return self._latest
+
+    def _run(self) -> None:
+        try:
+            while True:
+                with self._condition:
+                    while self._pending is None and not self._stop:
+                        self._condition.wait()
+                    if self._stop:
+                        return
+                    request_id, control_step, obs = self._pending
+                    self._pending = None
+                start = time.monotonic()
+                with torch.inference_mode():
+                    output = predict_policy(
+                        self._policy,
+                        obs,
+                        self._device,
+                        self._use_cm,
+                        self._initial_noise,
+                    )
+                if self._device.type == "cuda":
+                    torch.cuda.synchronize(self._device)
+                chunk = extract_action_chunk(output)
+                elapsed = time.monotonic() - start
+                with self._condition:
+                    self._latest = (
+                        request_id,
+                        control_step,
+                        chunk,
+                        elapsed,
+                        time.monotonic(),
+                    )
+        except BaseException as exc:
+            with self._condition:
+                self._error = exc
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
+        self._thread.join(timeout=2.0)
 
 
 class PiperPickPlaceStateReader:
@@ -177,6 +403,13 @@ def build_obs(history: deque[dict[str, np.ndarray]], device: torch.device) -> di
         "point_cloud": torch.from_numpy(np.stack([x["point_cloud"] for x in history])).unsqueeze(0).to(device),
         "image": torch.from_numpy(np.stack([x["image"] for x in history])).unsqueeze(0).to(device),
     }
+
+
+def predict_policy(policy, obs, device, use_cm, initial_noise=None):
+    """Run policy inference without changing the configured DDIM step count."""
+    return policy.predict_action(
+        obs, deterministic=True, use_cm=use_cm, initial_noise=initial_noise
+    )
 
 
 def extract_action_chunk(
@@ -389,7 +622,7 @@ def offline_smoke(dataset, policy, device, use_cm: bool, expected_steps: int) ->
     sample = dataset[0]["obs"]
     obs = {k: v.unsqueeze(0).to(device) for k, v in sample.items()}
     with torch.no_grad():
-        output = policy.predict_action(obs, deterministic=True, use_cm=use_cm)
+        output = predict_policy(policy, obs, device, use_cm)
     chunk = extract_action_chunk(output, expected_steps)
     print(f"[offline-smoke] 成功，反归一化 chunk shape={chunk.shape}", flush=True)
     print(f"[offline-smoke] 第一动作={np.round(chunk[0], 6)}", flush=True)
@@ -400,6 +633,15 @@ def parse_args():
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--policy-subdir", choices=["best", "bc", "best_cm"], default="best")
     p.add_argument("--device", default="cuda:0")
+    p.add_argument(
+        "--ddim-steps",
+        type=int,
+        default=None,
+        help=(
+            "覆盖 BC 策略的 DDIM 推理步数（1-10）。步数越少越快，"
+            "但与训练时的 10-step 采样分布偏差越大；best_cm 不受影响。"
+        ),
+    )
     p.add_argument("--offline-smoke", action="store_true")
     p.add_argument("--can", default="can0")
     p.add_argument("--piper-sdk-root", type=Path, default=None)
@@ -439,7 +681,16 @@ def parse_args():
         help="跳过夹爪训练范围、当前宽度和速度检查；关节安全限制仍保留。",
     )
     p.add_argument("--speed-percent", type=int, default=10)
-    p.add_argument("--reuse-diffusion-noise", action="store_true")
+    p.add_argument(
+        "--reuse-diffusion-noise",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "在一个真机 episode 内复用固定扩散初始噪声，避免相同观测因"
+            "每次重新采样噪声而输出不同目标；默认关闭，以保持训练/旧推理"
+            "的逐次随机采样语义。需要固定采样时显式传入此参数。"
+        ),
+    )
     p.add_argument("--diffusion-noise-seed", type=int, default=42)
     p.add_argument("--max-point-outlier-fraction", type=float, default=0.25)
     p.add_argument(
@@ -459,8 +710,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.rate <= 0 or args.rate > 20:
-        raise ValueError("--rate 必须在 (0,20] Hz")
+    if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
+        available_cpus = set(os.sched_getaffinity(0))
+        if 0 in available_cpus and len(available_cpus) > 1:
+            os.sched_setaffinity(0, available_cpus - {0})
+    if args.rate <= 0 or args.rate > 60:
+        raise ValueError("--rate 必须在 (0,60] Hz")
     if args.camera_fps < args.rate or args.max_steps <= 0:
         raise ValueError("camera-fps 必须不低于 rate，max-steps 必须为正")
     if args.chunk_exec_steps < 1:
@@ -472,11 +727,54 @@ def main():
     if args.rate > 15:
         print(
             "[时序警告] 当前 rate 高于采集相机的 15Hz；训练 transition 实际约 13Hz，"
-            "20Hz 推理会产生观察历史和 action chunk 的时序分布偏移。",
+            "高频推理会产生观察历史和 action chunk 的时序分布偏移。",
             flush=True,
         )
     args.output_dir = args.output_dir.expanduser().resolve()
-    cfg, dataset, policy, use_cm = contact.load_policy_and_dataset(args.output_dir, args.policy_subdir, args.device)
+
+    # On Jetson/Thor, resolving the D435i UVC profile can fail after CUDA has
+    # initialized a large policy in unified memory. Open and start the camera
+    # before loading the dataset/model; keeping the already-started pipeline
+    # alive while CUDA initializes is reliable on this host.
+    camera = None
+    if not args.offline_smoke:
+        from tools.teleop_off2off_data.realsense import RealSense
+
+        raw_camera = RealSense(
+            fps=args.camera_fps,
+            color_width=640,
+            color_height=480,
+            depth_width=640,
+            depth_height=480,
+            num_points=512,
+            point_cloud_frame="camera",
+            align_depth_to_color=False,
+        )
+        camera = LatestFrameCamera(raw_camera)
+        camera.start()
+    try:
+        cfg, dataset, policy, use_cm = contact.load_policy_and_dataset(
+            args.output_dir, args.policy_subdir, args.device
+        )
+    except Exception:
+        if camera is not None:
+            camera.stop()
+        raise
+    if args.ddim_steps is not None:
+        if not 1 <= args.ddim_steps <= 10:
+            raise ValueError("--ddim-steps 必须在 [1,10] 范围内")
+        if use_cm:
+            print("[采样] best_cm 使用固定 CM 步数，忽略 --ddim-steps", flush=True)
+        elif not hasattr(policy, "ddim_inference_steps"):
+            raise RuntimeError("当前策略没有 ddim_inference_steps 属性，无法覆盖采样步数")
+        else:
+            original_steps = int(policy.ddim_inference_steps)
+            policy.ddim_inference_steps = int(args.ddim_steps)
+            print(
+                f"[采样] BC DDIM steps: {original_steps} -> "
+                f"{policy.ddim_inference_steps}",
+                flush=True,
+            )
     if list(cfg.shape_meta.obs.agent_pos.shape) != [7] or list(cfg.shape_meta.action.shape) != [7]:
         raise RuntimeError(f"训练配置不是 7D：agent_pos={cfg.shape_meta.obs.agent_pos.shape}, action={cfg.shape_meta.action.shape}")
     n_obs_steps = int(cfg.n_obs_steps)
@@ -506,15 +804,6 @@ def main():
         )
         return
 
-    from tools.teleop_off2off_data.realsense import RealSense
-
-    # RealSense 必须在读取整套训练统计和启动 Piper CAN 后台线程之前
-    # 打开。当前 ARM 主机上，training_stats() 之后再解析 UVC profile
-    # 会稳定失败；这个顺序已用完整 BC 模型、D435i 和 can_right 验证。
-    camera = RealSense(fps=args.camera_fps, color_width=640, color_height=480,
-                       depth_width=640, depth_height=480, num_points=512,
-                       point_cloud_frame="camera", align_depth_to_color=False)
-    camera.start()
     try:
         stats = training_stats(dataset)
         print("[训练范围] state:", stats["state_min"], stats["state_max"], flush=True)
@@ -525,8 +814,10 @@ def main():
             f"threshold={args.gripper_command_threshold:g}",
             flush=True,
         )
-        C_PiperInterface_V2 = contact.import_piper_sdk(args.piper_sdk_root)
-        piper = C_PiperInterface_V2(args.can)
+        # Piper SDK runs several high-rate Python CAN/parser threads.  Keeping
+        # them in this process makes small CUDA kernel launches wait for the
+        # GIL and increases 10-step DDIM latency from ~16 ms to ~52 ms on Thor.
+        piper = PiperProcessProxy(args.can, args.piper_sdk_root)
         piper.ConnectPort()
         reader = PiperPickPlaceStateReader(piper)
     except Exception:
@@ -539,6 +830,16 @@ def main():
         f"{args.chunk_exec_steps} 步；"
         f"动作下发 {args.rate:g}Hz，模型重规划约 "
         f"{args.rate / args.chunk_exec_steps:g}Hz",
+        flush=True,
+    )
+    print("[策略时序] 异步策略推理 + 后台最新相机帧", flush=True)
+    print(
+        "[扩散噪声] "
+        + (
+            f"episode内固定复用，seed={args.diffusion_noise_seed}"
+            if args.reuse_diffusion_noise
+            else "每次推理重新随机采样（可能导致目标抖动）"
+        ),
         flush=True,
     )
     print("[人工] 输入 stop/Enter 停止并保持；输入 estop 发送 SDK 硬急停。", flush=True)
@@ -561,6 +862,7 @@ def main():
     last_joint_fresh = time.monotonic()
     last_grip_fresh = time.monotonic()
     episode_noise = contact.make_episode_diffusion_noise(policy, device, args.diffusion_noise_seed) if args.reuse_diffusion_noise else None
+    policy_worker: AsyncPolicyWorker | None = None
     try:
         # 用实时数据填满训练配置中的观察窗口，不复制第一帧。
         for _ in range(n_obs_steps):
@@ -570,6 +872,25 @@ def main():
             history.append({"agent_pos": state, "point_cloud": pc, "image": image})
             time.sleep(1.0 / args.rate)
         last_state = history[-1]["agent_pos"].copy()
+
+        # CUDA 的第一次 forward 会初始化 context、cuDNN/cuBLAS kernels，
+        # 延迟可能远超一个实时周期。必须在启动 deadline 计时和使能机械臂
+        # 之前预热，否则 CPU 能通过而 CUDA 在第一步被误判为持续落后。
+        if device.type == "cuda":
+            print("[CUDA] 开始推理预热...", flush=True)
+            warmup_obs = build_obs(history, device)
+            with torch.no_grad():
+                for _ in range(2):
+                    predict_policy(
+                        policy, warmup_obs, device, use_cm, episode_noise
+                    )
+            torch.cuda.synchronize(device)
+            print("[CUDA] 推理预热完成", flush=True)
+        else:
+            with torch.inference_mode():
+                predict_policy(
+                    policy, build_obs(history, device), device, use_cm, episode_noise
+                )
         if args.execute:
             phrase = input("确认工作区安全后输入 EXECUTE PIPER 继续：").strip()
             if phrase != "EXECUTE PIPER":
@@ -584,10 +905,34 @@ def main():
                 float(last_state[6]),
                 require_homing=not args.skip_gripper_safety_check,
             )
+
+        # 人工确认可能持续数秒。确认后重新采集完整观察窗口，并同步计算首个
+        # chunk，禁止把确认前的陈旧视觉和动作作为 step 0 下发。
+        history.clear()
+        for _ in range(n_obs_steps):
+            state, _, _ = reader.read()
+            frame = camera.get_frame(require_pc=False)
+            image, pc = preprocess_camera_frame(frame)
+            history.append({"agent_pos": state, "point_cloud": pc, "image": image})
+            time.sleep(1.0 / args.rate)
+        last_state = history[-1]["agent_pos"].copy()
+        with torch.inference_mode():
+            initial_output = predict_policy(
+                policy, build_obs(history, device), device, use_cm, episode_noise
+            )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        initial_chunk = extract_action_chunk(
+            initial_output, expected_steps=n_action_steps
+        )
+        policy_worker = AsyncPolicyWorker(policy, device, use_cm, episode_noise)
+        policy_worker.start()
         operator.start()
         next_deadline = time.monotonic()
-        active_chunk: np.ndarray | None = None
-        inference_index = -1
+        active_chunk: np.ndarray = initial_chunk
+        active_chunk_origin_step = 0
+        inference_index = 0
+        last_policy_result_id = -1
         for step in range(args.max_steps):
             command = operator.poll()
             if command in {"estop", "e", "emergency"}:
@@ -619,21 +964,34 @@ def main():
                     pc, contact.TrainingStats(stats["state_min"][:6], stats["state_max"][:6], stats["action_min"][:6], stats["action_max"][:6], stats["action_delta_p99"][:6], stats["pc_low"], stats["pc_high"]), args.max_point_outlier_fraction
                 )
             history.append({"agent_pos": state, "point_cloud": pc, "image": image})
-            chunk_step = step % args.chunk_exec_steps
-            ran_inference = chunk_step == 0 or active_chunk is None
-            if ran_inference:
-                with torch.no_grad():
-                    output = policy.predict_action(
-                        build_obs(history, device),
-                        deterministic=True,
-                        use_cm=use_cm,
-                        initial_noise=episode_noise,
-                    )
-                active_chunk = extract_action_chunk(
-                    output, expected_steps=n_action_steps
-                )
+            replan_step = step % args.chunk_exec_steps
+            requested_inference = replan_step == 0
+            ran_inference = False
+            infer_elapsed = 0.0
+            obs_build_elapsed = 0.0
+            if requested_inference:
+                obs_build_start = time.monotonic()
+                policy_obs = build_obs(history, device)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                obs_build_elapsed = time.monotonic() - obs_build_start
+                policy_worker.submit(policy_obs, control_step=step)
+            latest_policy = policy_worker.latest()
+            if latest_policy is not None and latest_policy[0] > last_policy_result_id:
+                (
+                    last_policy_result_id,
+                    active_chunk_origin_step,
+                    active_chunk,
+                    infer_elapsed,
+                    _,
+                ) = latest_policy
                 inference_index += 1
-                chunk_step = 0
+                ran_inference = True
+            # 记录异步结果年龄用于诊断。模型 chunk 的离散时间来自约13Hz
+            # 的训练数据，不能按30Hz控制周期直接跳到后续动作，否则会改变
+            # 权重原本的动作语义。
+            policy_age_steps = max(0, step - active_chunk_origin_step)
+            chunk_step = replan_step
             predicted_action = active_chunk[chunk_step]
             target, warnings = safe_action(predicted_action, state, stats, args)
             if robot_enabled:
@@ -644,12 +1002,20 @@ def main():
                 "joint_gripper_state": state.tolist(),
                 "predicted_chunk": active_chunk.tolist(),
                 "chunk_step": chunk_step,
+                "policy_chunk_origin_step": active_chunk_origin_step,
+                "policy_age_steps": policy_age_steps,
+                "replan_step": replan_step,
                 "policy_inference": ran_inference,
+                "policy_inference_requested": requested_inference,
+                "policy_result_id": last_policy_result_id,
                 "inference_index": inference_index,
                 "safe_action": target.tolist(),
                 "point_outlier_fraction": fraction,
                 "warnings": warnings,
                 "executed": robot_enabled,
+                "cycle_elapsed_s": time.monotonic() - loop_start,
+                "inference_elapsed_s": infer_elapsed if ran_inference else None,
+                "obs_build_elapsed_s": obs_build_elapsed if ran_inference else None,
             }
             records.append(record)
             print(
@@ -657,7 +1023,10 @@ def main():
                 f"chunk{chunk_step}={np.round(predicted_action,4)} "
                 f"target={np.round(target,4)} pc_out={fraction:.1%} "
                 f"{'INFER' if ran_inference else 'CACHED'} "
-                f"{'EXEC' if robot_enabled else 'SHADOW'}",
+                f"{'EXEC' if robot_enabled else 'SHADOW'} "
+                f"dt={record['cycle_elapsed_s']*1000:.1f}ms"
+                + (f" infer={infer_elapsed*1000:.1f}ms" if ran_inference else "")
+                + (f" obs={obs_build_elapsed*1000:.1f}ms" if ran_inference else ""),
                 flush=True,
             )
             for warning in warnings:
@@ -675,6 +1044,8 @@ def main():
         stop_reason = "exception_hold"
         raise
     finally:
+        if policy_worker is not None:
+            policy_worker.stop()
         if robot_enabled and not hard_emergency and last_state is not None:
             try:
                 # 停止时关节和夹爪都保持最后反馈姿态，不自动张开夹爪，避免方块掉落。
@@ -687,11 +1058,15 @@ def main():
             camera.stop()
         except Exception as exc:
             print(f"[相机] 停止失败: {exc}", file=sys.stderr, flush=True)
+        try:
+            piper.close()
+        except Exception as exc:
+            print(f"[Piper] 子进程停止失败: {exc}", file=sys.stderr, flush=True)
         log_path = args.log.expanduser()
         if not log_path.is_absolute():
             log_path = REPO_ROOT / log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "reuse_diffusion_noise": args.reuse_diffusion_noise, "diffusion_noise_seed": args.diffusion_noise_seed, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[日志] 已保存: {log_path.resolve()}", flush=True)
 
 

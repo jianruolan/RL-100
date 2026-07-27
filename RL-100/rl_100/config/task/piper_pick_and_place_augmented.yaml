@@ -28,6 +28,9 @@ dataset: &dataset
   seed: ${training.seed}
   val_ratio: 0.125
   max_train_episodes: null
+  # 73条扩增轨迹中约64条用于训练；每epoch抽4窗即256个样本。
+  windows_per_episode_per_epoch: 4
+  epoch_sampling_seed: ${training.seed}
   pre_image_norm: false
   controlled_dims: 7
   use_gripper_head: false

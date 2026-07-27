@@ -411,6 +411,13 @@ class TrainDP3Workspace:
         # pdb.set_trace()
         assert isinstance(dataset, BaseDataset), print(f"dataset must be BaseDataset, got {type(dataset)}")
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        windows_per_episode = getattr(
+            dataset, 'windows_per_episode_per_epoch', None)
+        if windows_per_episode is not None:
+            cprint(
+                f'[轨迹采样] 每条训练episode每epoch随机抽{windows_per_episode}个窗口；'
+                f'当前每epoch共{len(dataset)}个窗口、{len(train_dataloader)}个batch',
+                'cyan')
         if (self.cfg.off2off and self.cfg.off2off_no_bc) or self.cfg.use_pre_norm:
             norm_dataset = hydra.utils.instantiate(cfg.task.norm_dataset)
             normalizer = norm_dataset.get_normalizer()
@@ -518,7 +525,10 @@ class TrainDP3Workspace:
             # 周期checkpoint在epoch末尾递增计数之前保存，因此意外中断后会
             # 安全地重跑最近一个epoch，而不是把整个BC阶段误判为已经完成。
             first_epoch = self.epoch if resume_incomplete_bc else 0
+            bc_train_start = time.monotonic()
             for local_epoch_idx in range(first_epoch, cfg.training.num_epochs):
+                if hasattr(dataset, 'set_epoch'):
+                    dataset.set_epoch(local_epoch_idx)
                 # KL annealing
                 if cfg.kl_annealing and hasattr(self.model.obs_encoder, 'beta_kl'):
                     progress = local_epoch_idx / max(cfg.training.num_epochs - 1, 1)
@@ -687,6 +697,23 @@ class TrainDP3Workspace:
                 wandb_run.log(step_log, step=self.global_step)
                 self.global_step += 1
                 self.epoch += 1
+                completed_epochs = local_epoch_idx - first_epoch + 1
+                remaining_epochs = cfg.training.num_epochs - local_epoch_idx - 1
+                if (completed_epochs == 1 or completed_epochs % 10 == 0
+                        or remaining_epochs == 0):
+                    elapsed = time.monotonic() - bc_train_start
+                    seconds_per_epoch = elapsed / completed_epochs
+                    eta_seconds = seconds_per_epoch * remaining_epochs
+                    eta_minutes = eta_seconds / 60.0
+                    total_minutes = (
+                        elapsed + eta_seconds) / 60.0
+                    cprint(
+                        f'[训练ETA] epoch {local_epoch_idx + 1}/'
+                        f'{cfg.training.num_epochs} | '
+                        f'{seconds_per_epoch:.2f}s/epoch | '
+                        f'预计剩余{eta_minutes:.1f}分钟 | '
+                        f'预计总耗时{total_minutes:.1f}分钟',
+                        'cyan')
                 del step_log
         
         self.offline_best_path = self.get_global_best_dir()

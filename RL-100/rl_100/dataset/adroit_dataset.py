@@ -45,6 +45,8 @@ class AdroitDataset(BaseDataset):
             gripper_future_offset=3,
             gripper_event_radius=2,
             gripper_event_weight=10.0,
+            windows_per_episode_per_epoch=None,
+            epoch_sampling_seed=None,
             ):
         super().__init__()
         self.task_name = task_name
@@ -61,6 +63,12 @@ class AdroitDataset(BaseDataset):
         self.gripper_future_offset = gripper_future_offset
         self.gripper_event_radius = gripper_event_radius
         self.gripper_event_weight = gripper_event_weight
+        self.windows_per_episode_per_epoch = windows_per_episode_per_epoch
+        self.epoch_sampling_seed = seed if epoch_sampling_seed is None else epoch_sampling_seed
+
+        if (self.windows_per_episode_per_epoch is not None
+                and self.windows_per_episode_per_epoch < 1):
+            raise ValueError('windows_per_episode_per_epoch必须为正整数或null')
 
         if self.use_gripper_head:
             if self.gripper_horizon < 1 or self.gripper_future_offset < 0:
@@ -81,6 +89,9 @@ class AdroitDataset(BaseDataset):
             ])
         # 在复制整个数据集前先给出明确的缺字段错误，避免把旧 action 静默用于新任务。
         root = zarr.open(os.path.expanduser(zarr_path), mode='r')
+        self.has_sequence_breaks = 'sequence_break' in root['data']
+        if self.has_sequence_breaks:
+            keys.append('sequence_break')
         missing_keys = sorted(set(keys) - set(root['data'].keys()))
         if missing_keys:
             raise KeyError(
@@ -139,6 +150,7 @@ class AdroitDataset(BaseDataset):
             pad_after=sampler_pad_after,
             episode_mask=train_mask,
             sequence_stride=sequence_stride)
+        self._filter_sequence_break_windows(self.sampler)
         self.train_mask = train_mask
         self.horizon = horizon
         self.sampler_horizon = sampler_horizon
@@ -146,6 +158,46 @@ class AdroitDataset(BaseDataset):
         self.pad_after = pad_after
         self.sampler_pad_after = sampler_pad_after
         self.sequence_stride = sequence_stride
+        self._all_sampler_indices = np.arange(len(self.sampler), dtype=np.int64)
+        self._epoch_sampler_indices = self._all_sampler_indices
+        episode_ends = self.replay_buffer.episode_ends[:]
+        self._sampler_episode_ids = np.searchsorted(
+            episode_ends, self.sampler.indices[:, 0], side='right')
+        self.set_epoch(0)
+
+    def _filter_sequence_break_windows(self, sampler):
+        """删除跨越预处理断点的窗口，同时允许窗口从断点帧本身开始。"""
+        if not self.has_sequence_breaks or not len(sampler.indices):
+            return
+        breaks = np.asarray(
+            self.replay_buffer['sequence_break'][:], dtype=bool
+        ).reshape(-1)
+        prefix = np.r_[0, np.cumsum(breaks.astype(np.int64))]
+        starts = sampler.indices[:, 0]
+        ends = sampler.indices[:, 1]
+        # break[j]=True 表示 j-1 与 j 之间不连续。仅当窗口同时包含两侧时删除；
+        # 从 j 开始的新窗口是合法的。
+        crossed = prefix[ends] - prefix[np.minimum(starts + 1, ends)]
+        sampler.indices = sampler.indices[crossed == 0]
+
+    def set_epoch(self, epoch: int):
+        """每个epoch从每条训练轨迹中无放回抽取少量序列窗口。"""
+        if self.windows_per_episode_per_epoch is None:
+            self._epoch_sampler_indices = self._all_sampler_indices
+            return
+        rng = np.random.default_rng(
+            np.random.SeedSequence([int(self.epoch_sampling_seed), int(epoch)]))
+        selected = []
+        for episode_id in np.flatnonzero(self.train_mask):
+            candidates = self._all_sampler_indices[
+                self._sampler_episode_ids == episode_id]
+            count = min(int(self.windows_per_episode_per_epoch), len(candidates))
+            if count:
+                selected.append(rng.choice(candidates, size=count, replace=False))
+        self._epoch_sampler_indices = (
+            np.concatenate(selected).astype(np.int64, copy=False)
+            if selected else np.zeros(0, dtype=np.int64)
+        )
     def reward_scaling(self, scaling_strategy = 'dynamic', gamma = 0.99):
         if scaling_strategy == 'dynamic':
             print('scaling reward dynamically')
@@ -170,7 +222,15 @@ class AdroitDataset(BaseDataset):
             episode_mask=~self.train_mask,
             sequence_stride=self.sequence_stride,
             )
+        val_set._filter_sequence_break_windows(val_set.sampler)
         val_set.train_mask = ~self.train_mask
+        # validation始终遍历完整验证窗口，不受训练epoch随机采样影响。
+        val_set.windows_per_episode_per_epoch = None
+        val_set._all_sampler_indices = np.arange(len(val_set.sampler), dtype=np.int64)
+        val_set._epoch_sampler_indices = val_set._all_sampler_indices
+        episode_ends = self.replay_buffer.episode_ends[:]
+        val_set._sampler_episode_ids = np.searchsorted(
+            episode_ends, val_set.sampler.indices[:, 0], side='right')
         return val_set
 
     def get_normalizer(self, mode='limits', **kwargs):
@@ -194,7 +254,7 @@ class AdroitDataset(BaseDataset):
         return normalizer
 
     def __len__(self) -> int:
-        return len(self.sampler)
+        return len(self._epoch_sampler_indices)
 
     def _sample_to_data(self, sample, valid_mask=None):
         state_slice = slice(None, self.controlled_dims)
@@ -289,11 +349,12 @@ class AdroitDataset(BaseDataset):
         return torch_data
 
     def get_length(self, ):
-        return len(self.sampler.indices)
+        return len(self)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self.sampler.sample_sequence(idx)
-        _, _, sample_start_idx, sample_end_idx = self.sampler.indices[idx]
+        sampler_idx = int(self._epoch_sampler_indices[idx])
+        sample = self.sampler.sample_sequence(sampler_idx)
+        _, _, sample_start_idx, sample_end_idx = self.sampler.indices[sampler_idx]
         valid_mask = np.zeros(self.sampler_horizon, dtype=bool)
         valid_mask[sample_start_idx:sample_end_idx] = True
         data = self._sample_to_data(sample, valid_mask=valid_mask)

@@ -104,7 +104,8 @@ class RealSense(object):
         self.depth_height = depth_height
         self.color_width = color_width
         self.color_height = color_height
-        self.fps = fps
+        self.requested_fps = int(fps)
+        self.fps = int(fps)
         self.num_points = num_points
         self.point_cloud_frame = point_cloud_frame
         # 旧 contact 推理默认使用对齐后的深度；ROS bag pick-and-place
@@ -120,6 +121,63 @@ class RealSense(object):
         self.color_format = rs.format.bgr8
         self.align = rs.align(rs.stream.color)
 
+    @staticmethod
+    def _video_profile_fps(device, stream, fmt, width, height):
+        """Return FPS values exposed for one exact video stream profile."""
+
+        result = set()
+        for sensor in device.query_sensors():
+            for profile in sensor.get_stream_profiles():
+                try:
+                    video = profile.as_video_stream_profile()
+                    if (
+                        profile.stream_type() == stream
+                        and profile.format() == fmt
+                        and video.width() == width
+                        and video.height() == height
+                    ):
+                        result.add(int(profile.fps()))
+                except RuntimeError:
+                    continue
+        return result
+
+    def _resolve_common_fps(self, device):
+        """Promote an unsupported request to the nearest usable common FPS."""
+
+        depth_fps = self._video_profile_fps(
+            device,
+            rs.stream.depth,
+            rs.format.z16,
+            self.depth_width,
+            self.depth_height,
+        )
+        color_fps = self._video_profile_fps(
+            device,
+            rs.stream.color,
+            self.color_format,
+            self.color_width,
+            self.color_height,
+        )
+        common = sorted(depth_fps & color_fps)
+        if not common:
+            raise RuntimeError(
+                "RealSense深度/彩色没有共同stream profile: "
+                f"depth={self.depth_width}x{self.depth_height}/{depth_fps}, "
+                f"color={self.color_width}x{self.color_height}/{color_fps}"
+            )
+        if self.requested_fps in common:
+            selected = self.requested_fps
+        else:
+            not_slower = [fps for fps in common if fps >= self.requested_fps]
+            selected = min(not_slower) if not_slower else max(common)
+            print(
+                f"[realsense] requested {self.requested_fps}fps is unavailable "
+                f"at {self.color_width}x{self.color_height}; using "
+                f"{selected}fps (common={common})",
+                flush=True,
+            )
+        self.fps = selected
+
     def _new_pipeline(self):
         """Create a fresh pipeline/config pair for one start attempt."""
 
@@ -129,13 +187,15 @@ class RealSense(object):
             context = rs.context()
             devices = list(context.query_devices())
             if len(devices) == 1:
-                self.device_serial = devices[0].get_info(rs.camera_info.serial_number)
+                device = devices[0]
+                self.device_serial = device.get_info(rs.camera_info.serial_number)
                 print(
                     f"[realsense] selected device: "
-                    f"{devices[0].get_info(rs.camera_info.name)} "
+                    f"{device.get_info(rs.camera_info.name)} "
                     f"serial={self.device_serial}",
                     flush=True,
                 )
+                self._resolve_common_fps(device)
             del devices, context
         if self.device_serial:
             self.config.enable_device(self.device_serial)
@@ -154,7 +214,31 @@ class RealSense(object):
             self.fps,
         )
 
-    def start(self):
+    def _hardware_reset(self):
+        """Reset only the selected RealSense and wait for USB re-enumeration."""
+
+        context = rs.context()
+        devices = list(context.query_devices())
+        selected = None
+        for device in devices:
+            try:
+                serial = device.get_info(rs.camera_info.serial_number)
+            except RuntimeError:
+                continue
+            if self.device_serial is None or serial == self.device_serial:
+                selected = device
+                break
+        if selected is None:
+            raise RuntimeError(
+                f"cannot find RealSense serial={self.device_serial} for reset"
+            )
+        selected.hardware_reset()
+        print("[realsense] hardware reset sent; waiting for USB re-enumeration", flush=True)
+        del selected, devices, context
+        gc.collect()
+        time.sleep(3.0)
+
+    def start(self, _allow_hardware_reset=True):
         last_error = None
         profile = None
         for attempt in range(5):
@@ -194,22 +278,45 @@ class RealSense(object):
                 gc.collect()
                 time.sleep(0.5)
         if profile is None:
+            if _allow_hardware_reset:
+                print(
+                    "[realsense] profile resolution failed repeatedly; "
+                    "attempting one hardware reset",
+                    flush=True,
+                )
+                self._hardware_reset()
+                return self.start(_allow_hardware_reset=False)
             raise RuntimeError(f"failed to start RealSense pipeline after retries: {last_error}")
 
         # get intrinsics from raw frames first.  On some RealSense setups,
         # calling align.process() during startup can keep waiting even though
         # the raw depth/color streams are already producing frames.
         frames = None
-        for i in range(20):
+        for i in range(3):
             try:
-                print(f"[realsense] waiting for raw frames {i + 1}/20", flush=True)
-                frames = self.pipeline.wait_for_frames(5000)
+                print(f"[realsense] waiting for raw frames {i + 1}/3", flush=True)
+                frames = self.pipeline.wait_for_frames(3000)
                 if frames.get_depth_frame() and frames.get_color_frame():
                     break
             except RuntimeError as e:
                 print(f"[realsense] wait_for_frames failed: {e}", flush=True)
                 time.sleep(0.1)
         if frames is None or not frames.get_depth_frame() or not frames.get_color_frame():
+            try:
+                self.pipeline.stop()
+            except RuntimeError:
+                pass
+            self._started = False
+            self.pipeline = None
+            self.config = None
+            if _allow_hardware_reset:
+                print(
+                    "[realsense] pipeline started but delivered no frames; "
+                    "attempting one hardware reset",
+                    flush=True,
+                )
+                self._hardware_reset()
+                return self.start(_allow_hardware_reset=False)
             raise RuntimeError("failed to receive RealSense depth/color frames during startup")
         self.depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
         depth_frame = frames.get_depth_frame()

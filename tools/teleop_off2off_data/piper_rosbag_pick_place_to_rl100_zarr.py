@@ -10,6 +10,8 @@
 * gripper_command_state = Pico 开合命令锁存后的期望状态（1=张开，0=闭合）
 * gripper_open/close_event = 相邻保留 RGB 帧之间是否出现对应命令
 * 采样时间轴采用 RGB bag timestamp，其他 topic 做最近邻/线性插值。
+* 可选地仅保留 controlAccepted=true 的任务控制帧；被删除区间和采样时间跳变
+  会写入 sequence_break，供训练采样器禁止窗口跨越。
 * 点云由深度图和深度相机内参反投影，坐标系是深度相机 optical frame。
 * 仅转换元数据明确标记为成功且 rosbag 完整的 episode。
 """
@@ -468,7 +470,9 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
         joint_errors, grip_errors, status_errors = [], [], []
         depth_bag_errors, depth_header_errors = [], []
         control_accepted = []
+        trigger_home_active = []
         retained_rgb_times = []
+        retained_rgb_indices = []
         dropped_unpaired_depth = 0
         dropped_unpaired_robot = 0
         for frame_i, (timestamp, rgb_id) in enumerate(zip(rgb_times, rgb_ids)):
@@ -548,62 +552,160 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
             depth_bag_errors.append(depth_bag_error / 1e6)
             depth_header_errors.append(depth_header_error / 1e6)
             control_accepted.append(bool(status.get("controlAccepted", False)))
+            trigger_home_active.append(bool(status.get("triggerHomeActive", False)))
             retained_rgb_times.append(t)
+            retained_rgb_indices.append(frame_i)
 
         state = np.asarray(states, dtype=np.float32)
         action = np.asarray(actions, dtype=np.float32)
         image = np.asarray(images, dtype=np.uint8)
         point_cloud = np.asarray(point_clouds, dtype=np.float32)
-        if len(state) < args.min_episode_len:
-            raise RuntimeError(f"episode too short: {len(state)} < {args.min_episode_len}")
+        retained_rgb_times = np.asarray(retained_rgb_times, dtype=np.int64)
+        retained_rgb_indices = np.asarray(retained_rgb_indices, dtype=np.int64)
+        control_accepted = np.asarray(control_accepted, dtype=bool)
+        trigger_home_active = np.asarray(trigger_home_active, dtype=bool)
+        synchronized_frames = len(state)
+        if synchronized_frames < args.min_episode_len:
+            raise RuntimeError(
+                f"episode too short: {synchronized_frames} < {args.min_episode_len}"
+            )
         for name, value in {"state": state, "action": action, "img": image, "point_cloud": point_cloud}.items():
             if not np.all(np.isfinite(value)):
                 raise RuntimeError(f"non-finite value in {name}")
 
+        # controlAccepted=false 在这批数据中表示 Grip/deadman 未按下，其中还包括
+        # triggerHomeActive 的采集后自动回零。自主 pick-and-place BC 不应学习这些
+        # 等待/复位动作。删除它们后用 sequence_break 明确标记不连续处，避免
+        # SequenceSampler 把断点两侧误当作相邻时刻。
+        keep_mask = np.ones(synchronized_frames, dtype=bool)
+        eligible_control = control_accepted & ~trigger_home_active
+        eligible_indices = np.flatnonzero(eligible_control)
+        if len(eligible_indices):
+            first_control = int(eligible_indices[0])
+            last_control = int(eligible_indices[-1])
+            control_prefix_frames = first_control
+            control_suffix_frames = synchronized_frames - 1 - last_control
+            control_interior_rejected_frames = int(
+                np.count_nonzero(~eligible_control[first_control : last_control + 1])
+            )
+        else:
+            control_prefix_frames = synchronized_frames
+            control_suffix_frames = 0
+            control_interior_rejected_frames = 0
+        if args.control_accepted_only:
+            keep_mask &= eligible_control
+        kept_original_indices = np.flatnonzero(keep_mask)
+        if len(kept_original_indices) < args.min_episode_len:
+            raise RuntimeError(
+                f"episode has only {len(kept_original_indices)} accepted task frames; "
+                f"minimum is {args.min_episode_len}"
+            )
+
+        # 新段开始的条件：中间删除了 RGB/控制帧，或真实时间间隔超过显式阈值。
+        segment_start = np.zeros(len(kept_original_indices), dtype=bool)
+        segment_start[0] = True
+        if len(kept_original_indices) > 1:
+            previous = kept_original_indices[:-1]
+            current = kept_original_indices[1:]
+            segment_start[1:] |= retained_rgb_indices[current] != (
+                retained_rgb_indices[previous] + 1
+            )
+            if args.max_retained_frame_gap_ms is not None:
+                gap_ns = retained_rgb_times[current] - retained_rgb_times[previous]
+                segment_start[1:] |= gap_ns > int(
+                    args.max_retained_frame_gap_ms * 1e6
+                )
+
+        state = state[keep_mask]
+        action = action[keep_mask]
+        image = image[keep_mask]
+        point_cloud = point_cloud[keep_mask]
+        selected_rgb_times = retained_rgb_times[keep_mask]
+        selected_control_accepted = control_accepted[keep_mask]
+        selected_trigger_home = trigger_home_active[keep_mask]
         n = len(state)
+
         gripper_command_state, gripper_open_event, gripper_close_event, pico_conflicts = (
             align_gripper_commands(
                 pico_times,
                 pico_open,
                 pico_close,
-                np.asarray(retained_rgb_times, dtype=np.int64),
+                selected_rgb_times,
                 initial_open=bool(state[0, 6] >= args.gripper_open_threshold_m),
             )
         )
+        # 断点前发生的事件不应跨段成为监督标签；命令锁存状态仍保留。
+        gripper_open_event[segment_start] = 0
+        gripper_close_event[segment_start] = 0
         gripper_command_state = gripper_command_state[:, None]
         gripper_open_event = gripper_open_event[:, None]
         gripper_close_event = gripper_close_event[:, None]
-        reward = np.zeros((n, 1), dtype=np.float32)
-        reward[-1, 0] = args.terminal_reward
-        done = np.zeros((n, 1), dtype=bool)
-        timeout = np.zeros((n, 1), dtype=bool)
-        done[-1, 0] = True
-        timeout[-1, 0] = True
         # 新训练应读取 policy_action；旧 action 保留用于兼容与逐项验证。
         policy_action = np.concatenate(
             [action[:, :6], gripper_command_state.astype(np.float32)], axis=-1
         )
-        arrays = {
+
+        current_arrays = {
             "state": state,
-            "next_state": construct_next(state),
             "action": action,
-            "next_action": construct_next(action),
             "policy_action": policy_action,
-            "next_policy_action": construct_next(policy_action),
             "point_cloud": point_cloud,
-            "next_point_cloud": construct_next(point_cloud),
             "img": image,
-            "next_img": construct_next(image),
-            "reward": reward,
-            "done": done,
-            "timeout": timeout,
             "gripper_command_state": gripper_command_state,
-            "next_gripper_command_state": construct_next(gripper_command_state),
             "gripper_open_event": gripper_open_event,
-            "next_gripper_open_event": construct_next(gripper_open_event),
             "gripper_close_event": gripper_close_event,
-            "next_gripper_close_event": construct_next(gripper_close_event),
         }
+        segment_starts = np.flatnonzero(segment_start)
+        segment_ends = np.r_[segment_starts[1:], n]
+        segment_lengths = segment_ends - segment_starts
+        valid_segments = segment_lengths >= args.min_episode_len
+        dropped_short_segment_frames = int(segment_lengths[~valid_segments].sum())
+        segment_starts = segment_starts[valid_segments]
+        segment_ends = segment_ends[valid_segments]
+        if not len(segment_starts):
+            raise RuntimeError("no accepted task segment survives --min-episode-len")
+
+        pieces: dict[str, list[np.ndarray]] = {}
+        for segment_i, (start, end) in enumerate(zip(segment_starts, segment_ends)):
+            for key, value in current_arrays.items():
+                part = value[start:end]
+                pieces.setdefault(key, []).append(part)
+                pieces.setdefault(f"next_{key}", []).append(construct_next(part))
+            length = end - start
+            reward = np.zeros((length, 1), dtype=np.float32)
+            done = np.zeros((length, 1), dtype=bool)
+            timeout = np.zeros((length, 1), dtype=bool)
+            done[-1, 0] = True
+            timeout[-1, 0] = True
+            # 只有原任务的最后一个有效控制段获得成功奖励；较早断点只是采样边界。
+            if segment_i == len(segment_starts) - 1:
+                reward[-1, 0] = args.terminal_reward
+            pieces.setdefault("reward", []).append(reward)
+            pieces.setdefault("done", []).append(done)
+            pieces.setdefault("timeout", []).append(timeout)
+
+        arrays = {key: np.concatenate(value, axis=0) for key, value in pieces.items()}
+        kept_times = np.concatenate(
+            [selected_rgb_times[start:end] for start, end in zip(segment_starts, segment_ends)]
+        )
+        kept_control = np.concatenate(
+            [selected_control_accepted[start:end] for start, end in zip(segment_starts, segment_ends)]
+        )
+        kept_trigger_home = np.concatenate(
+            [selected_trigger_home[start:end] for start, end in zip(segment_starts, segment_ends)]
+        )
+        final_sequence_break = np.zeros(len(kept_times), dtype=bool)
+        offset = 0
+        for start, end in zip(segment_starts, segment_ends):
+            final_sequence_break[offset] = True
+            offset += end - start
+        arrays.update({
+            "timestamp_ns": kept_times,
+            "control_accepted": kept_control[:, None],
+            "trigger_home_active": kept_trigger_home[:, None],
+            "sequence_break": final_sequence_break[:, None],
+        })
+        n = len(kept_times)
 
         def stats(values: Iterable[float]) -> dict[str, float]:
             a = np.asarray(list(values), dtype=np.float64)
@@ -612,12 +714,32 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
         report = {
             "episode_id": episode_dir.name,
             "frames": n,
+            "synchronized_frames_before_control_filter": synchronized_frames,
             "input_rgb_frames": int(len(rgb_times)),
             "dropped_unpaired_depth_frames": dropped_unpaired_depth,
             "dropped_unpaired_robot_frames": dropped_unpaired_robot,
-            "duration_sec": float((retained_rgb_times[-1] - retained_rgb_times[0]) / 1e9) if n > 1 else 0.0,
-            "rgb_rate_hz": float((n - 1) / ((retained_rgb_times[-1] - retained_rgb_times[0]) / 1e9)) if n > 1 else 0.0,
+            "duration_sec": float((kept_times[-1] - kept_times[0]) / 1e9) if n > 1 else 0.0,
+            "rgb_rate_hz": float((n - 1) / ((kept_times[-1] - kept_times[0]) / 1e9)) if n > 1 else 0.0,
             "control_accepted_ratio": float(np.mean(control_accepted)),
+            "control_filter": {
+                "enabled": bool(args.control_accepted_only),
+                "prefix_frames_removed": (
+                    control_prefix_frames if args.control_accepted_only else 0
+                ),
+                "suffix_frames_removed": (
+                    control_suffix_frames if args.control_accepted_only else 0
+                ),
+                "interior_rejected_frames": (
+                    control_interior_rejected_frames
+                    if args.control_accepted_only else 0
+                ),
+                "trigger_home_frames": int(trigger_home_active.sum()),
+                "segments": int(len(segment_starts)),
+                "segment_lengths": [
+                    int(end - start) for start, end in zip(segment_starts, segment_ends)
+                ],
+                "dropped_short_segment_frames": dropped_short_segment_frames,
+            },
             "gripper_commands": {
                 "initial_open_from_feedback": bool(
                     state[0, 6] >= args.gripper_open_threshold_m
@@ -727,6 +849,14 @@ def write_zarr(episodes: list[dict[str, np.ndarray]], reports: list[dict[str, An
                 ),
             },
             "source_manifest": reports,
+            "sequence_break_definition": (
+                "true on the first frame of each contiguous accepted task segment; "
+                "training windows must not cross this boundary"
+            ),
+            "control_filter": {
+                "control_accepted_only": bool(args.control_accepted_only),
+                "max_retained_frame_gap_ms": args.max_retained_frame_gap_ms,
+            },
         }
     )
 
@@ -831,6 +961,20 @@ def parse_args():
     parser.add_argument("--max-depth-m", type=float, default=2.0)
     parser.add_argument("--max-depth-sync-ms", type=float, default=10.0)
     parser.add_argument("--max-robot-sync-ms", type=float, default=20.0)
+    parser.add_argument(
+        "--control-accepted-only",
+        action="store_true",
+        help=(
+            "仅保留controlAccepted=true且非triggerHomeActive的任务控制帧；"
+            "删除区间会生成sequence_break，防止训练窗口跨越"
+        ),
+    )
+    parser.add_argument(
+        "--max-retained-frame-gap-ms",
+        type=float,
+        default=None,
+        help="相邻保留帧超过该时间间隔时写入sequence_break；默认不额外按时间切断",
+    )
     parser.add_argument("--min-episode-len", type=int, default=2)
     parser.add_argument("--terminal-reward", type=float, default=1.0)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -889,6 +1033,8 @@ def main() -> None:
             "terminal_reward": args.terminal_reward,
             "gamma": args.gamma,
             "gripper_open_threshold_m": args.gripper_open_threshold_m,
+            "control_accepted_only": args.control_accepted_only,
+            "max_retained_frame_gap_ms": args.max_retained_frame_gap_ms,
         },
         "episodes": episode_reports,
         "validation": validation,
