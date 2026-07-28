@@ -11,21 +11,40 @@ run_dir="${RUN_DIR:-data/outputs/piper_pick_and_place_augmented_chunk4_dp3_episo
 dataset_path="${DATASET_PATH:-data/piper_pick_and_place_augmented_chunk4.zarr}"
 python_bin="${PYTHON_BIN:-python}"
 num_epochs="${NUM_EPOCHS:-800}"
+resume="${RESUME:-False}"
 windows_per_episode="${WINDOWS_PER_EPISODE:-4}"
 batch_size="${BATCH_SIZE:-256}"
 use_wandb="${USE_WANDB:-True}"
 wandb_mode="${WANDB_MODE:-online}"
+save_fraction_milestones="${SAVE_FRACTION_MILESTONES:-True}"
+save_best_val="${SAVE_BEST_VAL:-True}"
+n_obs_steps="${N_OBS_STEPS:-3}"
+action_steps="${ACTION_STEPS:-4}"
+horizon="${HORIZON:-$((n_obs_steps - 1 + action_steps))}"
 
 if ! [[ "${num_epochs}" =~ ^[1-9][0-9]*$ ]]; then
   echo "NUM_EPOCHS必须是正数，当前为: ${num_epochs}" >&2
   exit 2
 fi
+case "${resume}" in
+  True|False) ;;
+  *) echo "RESUME必须为True或False，当前为: ${resume}" >&2; exit 2 ;;
+esac
 if ! [[ "${windows_per_episode}" =~ ^[1-9][0-9]*$ ]]; then
   echo "WINDOWS_PER_EPISODE必须是正数，当前为: ${windows_per_episode}" >&2
   exit 2
 fi
 if ! [[ "${batch_size}" =~ ^[1-9][0-9]*$ ]]; then
   echo "BATCH_SIZE必须是正数，当前为: ${batch_size}" >&2
+  exit 2
+fi
+if ! [[ "${n_obs_steps}" =~ ^[1-9][0-9]*$ ]] || ! [[ "${action_steps}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "N_OBS_STEPS和ACTION_STEPS必须是正数，当前为: ${n_obs_steps}/${action_steps}" >&2
+  exit 2
+fi
+expected_horizon=$((n_obs_steps - 1 + action_steps))
+if ! [[ "${horizon}" =~ ^[1-9][0-9]*$ ]] || [ "${horizon}" -ne "${expected_horizon}" ]; then
+  echo "HORIZON必须等于N_OBS_STEPS+ACTION_STEPS-1=${expected_horizon}，当前为: ${horizon}" >&2
   exit 2
 fi
 
@@ -37,7 +56,8 @@ export MUJOCO_PY_MUJOCO_PATH="${MUJOCO_PY_MUJOCO_PATH:-$HOME/.mujoco/mujoco210}"
 export LD_LIBRARY_PATH="${MUJOCO_PY_MUJOCO_PATH}/bin:${MUJOCO_PY_MUJOCO_PATH}/lib:/usr/lib/nvidia:${LD_LIBRARY_PATH:-}"
 
 echo "[训练配置] standard DP3 | DDIM | no VIB/reconstruction/CM"
-echo "[训练配置] dataset=${dataset_path} epochs=${num_epochs} windows/episode=${windows_per_episode} batch_size=${batch_size}"
+echo "[训练配置] dataset=${dataset_path} epochs=${num_epochs} resume=${resume} windows/episode=${windows_per_episode} batch_size=${batch_size} obs_steps=${n_obs_steps} action_steps=${action_steps} horizon=${horizon}"
+echo "[训练配置] checkpoint milestones=${save_fraction_milestones} best_val=${save_best_val}"
 echo "[训练预计] 启动后根据前20个epoch的实测速度输出ETA"
 
 "${python_bin}" train.py --config-name=rl100_3d_epsilon.yaml \
@@ -45,8 +65,11 @@ echo "[训练预计] 启动后根据前20个epoch的实测速度输出ETA"
   training.debug=False training.seed="${seed}" training.device=cuda:0 \
   exp_name="${task_name}-${alg_name}-${addition_info}" \
   logging.mode="${wandb_mode}" use_wandb="${use_wandb}" \
-  checkpoint.save_ckpt=True training.resume=False +stop_after_bc=True \
-  horizon=6 n_obs_steps=3 n_action_steps=4 chunk_as_single_action=True \
+  checkpoint.save_ckpt=True \
+  +checkpoint.save_fraction_milestones="${save_fraction_milestones}" \
+  +checkpoint.save_best_val="${save_best_val}" \
+  training.resume="${resume}" +stop_after_bc=True \
+  horizon="${horizon}" n_obs_steps="${n_obs_steps}" n_action_steps="${action_steps}" chunk_as_single_action=True \
   dynamics.prediction_mode=full only_bc=True offline=False online=False \
   distill_phase=null kl_annealing=False \
   policy._target_=rl_100.policy.rl100_3d.RL1003D \

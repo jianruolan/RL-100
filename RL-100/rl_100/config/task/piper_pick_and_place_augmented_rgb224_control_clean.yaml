@@ -1,0 +1,47 @@
+name: piper_pick_and_place_augmented_rgb224_control_clean
+task_name: piper_pick_and_place_augmented_rgb224_control_clean
+
+crop_shape: null
+
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: [3, 224, 224]
+      type: rgb
+    point_cloud:
+      shape: [512, 3]
+      type: point_cloud
+    agent_pos:
+      shape: [7]
+      type: low_dim
+  action:
+    shape: [7]
+
+env_runner: null
+
+dataset: &dataset
+  _target_: rl_100.dataset.adroit_dataset.AdroitDataset
+  zarr_path: data/piper_pick_and_place_augmented_chunk4_control_clean_rgb224.zarr
+  action_key: policy_action
+  action_dims: 7
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: ${training.seed}
+  val_ratio: 0.125
+  max_train_episodes: null
+  windows_per_episode_per_epoch: 10
+  epoch_sampling_seed: ${training.seed}
+  pre_image_norm: false
+  controlled_dims: 7
+  use_gripper_head: false
+  n_obs_steps: ${n_obs_steps}
+
+norm_dataset: *dataset
+critic_dataset:
+  <<: *dataset
+  val_ratio: 0.0
+scale_dataset:
+  <<: *dataset
+  val_ratio: 0.0
+  scale_strategy: dynamic

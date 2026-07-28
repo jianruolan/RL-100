@@ -206,11 +206,21 @@ class LatestFrameCamera:
 class AsyncPolicyWorker:
     """Run FP32 policy inference concurrently and keep only the newest request."""
 
-    def __init__(self, policy, device, use_cm: bool, initial_noise):
+    def __init__(
+        self,
+        policy,
+        device,
+        use_cm: bool,
+        initial_noise,
+        expected_action_steps: int,
+    ):
         self._policy = policy
         self._device = device
         self._use_cm = use_cm
         self._initial_noise = initial_noise
+        self._expected_action_steps = int(expected_action_steps)
+        if self._expected_action_steps < 1:
+            raise ValueError("expected_action_steps 必须为正整数")
         self._condition = threading.Condition()
         self._pending = None
         self._latest = None
@@ -261,7 +271,9 @@ class AsyncPolicyWorker:
                     )
                 if self._device.type == "cuda":
                     torch.cuda.synchronize(self._device)
-                chunk = extract_action_chunk(output)
+                chunk = extract_action_chunk(
+                    output, expected_steps=self._expected_action_steps
+                )
                 elapsed = time.monotonic() - start
                 with self._condition:
                     self._latest = (
@@ -631,7 +643,14 @@ def offline_smoke(dataset, policy, device, use_cm: bool, expected_steps: int) ->
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    p.add_argument("--policy-subdir", choices=["best", "bc", "best_cm"], default="best")
+    p.add_argument(
+        "--policy-subdir",
+        default="best",
+        help=(
+            "output-dir下的推理权重子目录，例如bc、best_val、"
+            "milestone_25/50/75。"
+        ),
+    )
     p.add_argument("--device", default="cuda:0")
     p.add_argument(
         "--ddim-steps",
@@ -710,6 +729,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    policy_subdir_path = Path(args.policy_subdir)
+    if policy_subdir_path.is_absolute() or ".." in policy_subdir_path.parts:
+        raise ValueError("--policy-subdir 必须是output-dir下的相对子目录")
     if hasattr(os, "sched_getaffinity") and hasattr(os, "sched_setaffinity"):
         available_cpus = set(os.sched_getaffinity(0))
         if 0 in available_cpus and len(available_cpus) > 1:
@@ -925,7 +947,13 @@ def main():
         initial_chunk = extract_action_chunk(
             initial_output, expected_steps=n_action_steps
         )
-        policy_worker = AsyncPolicyWorker(policy, device, use_cm, episode_noise)
+        policy_worker = AsyncPolicyWorker(
+            policy,
+            device,
+            use_cm,
+            episode_noise,
+            expected_action_steps=n_action_steps,
+        )
         policy_worker.start()
         operator.start()
         next_deadline = time.monotonic()
@@ -1066,7 +1094,7 @@ def main():
         if not log_path.is_absolute():
             log_path = REPO_ROOT / log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "reuse_diffusion_noise": args.reuse_diffusion_noise, "diffusion_noise_seed": args.diffusion_noise_seed, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "camera_fps": args.camera_fps, "speed_percent": args.speed_percent, "max_joint_speed_rad_s": args.max_joint_speed_rad_s, "max_gripper_speed_m_s": args.max_gripper_speed_m_s, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "reuse_diffusion_noise": args.reuse_diffusion_noise, "diffusion_noise_seed": args.diffusion_noise_seed, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[日志] 已保存: {log_path.resolve()}", flush=True)
 
 

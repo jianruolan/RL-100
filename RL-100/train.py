@@ -7,6 +7,7 @@ if __name__ == "__main__":
     sys.path.append(ROOT_DIR)
     os.chdir(ROOT_DIR)
 import argparse
+import json
 import os
 import hydra
 import torch
@@ -495,6 +496,46 @@ class TrainDP3Workspace:
             **cfg.checkpoint.topk
         )
 
+        save_fraction_milestones = bool(
+            getattr(cfg.checkpoint, 'save_fraction_milestones', False)
+        )
+        save_best_val = bool(
+            getattr(cfg.checkpoint, 'save_best_val', False)
+        )
+        total_bc_epochs = int(cfg.training.num_epochs)
+        milestone_epochs = {
+            max(1, int(round(total_bc_epochs * fraction))): label
+            for fraction, label in (
+                (0.25, 'milestone_25'),
+                (0.50, 'milestone_50'),
+                (0.75, 'milestone_75'),
+            )
+        } if save_fraction_milestones else {}
+        best_val_loss = float('inf')
+        best_val_epoch = None
+        best_val_dir = os.path.join(self.output_dir, 'best_val')
+        best_val_metadata_path = os.path.join(best_val_dir, 'metadata.json')
+        if save_best_val and os.path.isfile(best_val_metadata_path):
+            try:
+                with open(best_val_metadata_path, 'r', encoding='utf-8') as f:
+                    best_val_metadata = json.load(f)
+                best_val_loss = float(best_val_metadata['val_loss'])
+                best_val_epoch = int(best_val_metadata['completed_epoch'])
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                cprint('[checkpoint] 无法读取已有best_val元数据，将重新选择', 'yellow')
+
+        if milestone_epochs:
+            cprint(
+                '[checkpoint] 固定保留训练进度: '
+                + ', '.join(
+                    f'{label}={completed_epoch}epoch'
+                    for completed_epoch, label in sorted(milestone_epochs.items())
+                ),
+                'cyan',
+            )
+        if save_best_val:
+            cprint('[checkpoint] 额外保存验证损失最低的推理权重到 best_val/', 'cyan')
+
 
         self.model.to(device)
         if self.ema_model is not None:
@@ -640,6 +681,28 @@ class TrainDP3Workspace:
                                 if values:
                                     step_log[f'val_{key}'] = float(np.mean(values))
 
+                            if save_best_val and np.isfinite(val_loss) \
+                                    and val_loss < best_val_loss:
+                                best_val_loss = float(val_loss)
+                                best_val_epoch = self.epoch + 1
+                                os.makedirs(best_val_dir, exist_ok=True)
+                                self.model.save(best_val_dir)
+                                best_val_metadata = {
+                                    'completed_epoch': best_val_epoch,
+                                    'zero_based_epoch': int(self.epoch),
+                                    'global_step': int(self.global_step),
+                                    'val_loss': best_val_loss,
+                                }
+                                tmp_metadata_path = best_val_metadata_path + '.tmp'
+                                with open(tmp_metadata_path, 'w', encoding='utf-8') as f:
+                                    json.dump(best_val_metadata, f, indent=2)
+                                os.replace(tmp_metadata_path, best_val_metadata_path)
+                                cprint(
+                                    f'[checkpoint] best_val更新: completed_epoch='
+                                    f'{best_val_epoch}, val_loss={best_val_loss:.8f}',
+                                    'green',
+                                )
+
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
                     with torch.no_grad():
@@ -689,6 +752,39 @@ class TrainDP3Workspace:
                         self.unio4.set_policy(self.model); self.unio4.set_old_policy()
                         os.makedirs(os.path.join(self.output_dir, 'bc'), exist_ok=True)
                         self.unio4.save(os.path.join(self.output_dir, 'bc'))
+
+                completed_epoch = self.epoch + 1
+                milestone_label = milestone_epochs.get(completed_epoch)
+                if milestone_label is not None and cfg.checkpoint.save_ckpt:
+                    milestone_ckpt_path = os.path.join(
+                        self.output_dir,
+                        'checkpoints',
+                        f'{milestone_label}-epoch={completed_epoch:04d}.ckpt',
+                    )
+                    self.save_checkpoint(path=milestone_ckpt_path)
+                    milestone_dir = os.path.join(self.output_dir, milestone_label)
+                    os.makedirs(milestone_dir, exist_ok=True)
+                    self.model.save(milestone_dir)
+                    milestone_metadata = {
+                        'label': milestone_label,
+                        'completed_epoch': completed_epoch,
+                        'zero_based_epoch': int(self.epoch),
+                        'global_step': int(self.global_step),
+                        'total_epochs': total_bc_epochs,
+                        'fraction': completed_epoch / total_bc_epochs,
+                        'val_loss': step_log.get('val_loss'),
+                    }
+                    with open(
+                        os.path.join(milestone_dir, 'metadata.json'),
+                        'w',
+                        encoding='utf-8',
+                    ) as f:
+                        json.dump(milestone_metadata, f, indent=2)
+                    cprint(
+                        f'[checkpoint] 固定里程碑已保存: {milestone_label} '
+                        f'({completed_epoch}/{total_bc_epochs} epoch)',
+                        'green',
+                    )
                 # ========= eval end for this epoch ==========
                 policy.train()
 
