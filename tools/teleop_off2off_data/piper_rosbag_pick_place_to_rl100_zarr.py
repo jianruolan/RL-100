@@ -645,6 +645,53 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
             [action[:, :6], gripper_command_state.astype(np.float32)], axis=-1
         )
 
+        terminal_crop = None
+        if args.truncate_after_gripper_open_frames is not None:
+            # open_event可能包含操作者重复按键；锁存命令从close(0)切换到open(1)
+            # 才是真实松爪时刻。保留松爪后的固定数量已筛选控制帧，删除其后所有
+            # 撤离和回零准备动作。sequence_break仍原样保留，禁止跨越真实断点采样。
+            open_transitions = (
+                np.flatnonzero(
+                    np.diff(gripper_command_state[:, 0].astype(np.int8)) == 1
+                )
+                + 1
+            )
+            if not len(open_transitions):
+                raise RuntimeError(
+                    "--truncate-after-gripper-open-frames需要每条轨迹包含至少一个"
+                    "gripper_command_state 0->1松爪转换"
+                )
+            release_index = int(open_transitions[-1])
+            crop_end = min(
+                n,
+                release_index + 1 + int(args.truncate_after_gripper_open_frames),
+            )
+            terminal_crop = {
+                "release_frame_before_segment_filter": release_index,
+                "requested_post_open_frames": int(
+                    args.truncate_after_gripper_open_frames
+                ),
+                "retained_post_open_frames_before_segment_filter": int(
+                    crop_end - release_index - 1
+                ),
+                "frames_before_crop": n,
+                "frames_after_crop_before_segment_filter": crop_end,
+                "suffix_frames_removed_by_terminal_crop": n - crop_end,
+            }
+            state = state[:crop_end]
+            action = action[:crop_end]
+            image = image[:crop_end]
+            point_cloud = point_cloud[:crop_end]
+            selected_rgb_times = selected_rgb_times[:crop_end]
+            selected_control_accepted = selected_control_accepted[:crop_end]
+            selected_trigger_home = selected_trigger_home[:crop_end]
+            segment_start = segment_start[:crop_end]
+            gripper_command_state = gripper_command_state[:crop_end]
+            gripper_open_event = gripper_open_event[:crop_end]
+            gripper_close_event = gripper_close_event[:crop_end]
+            policy_action = policy_action[:crop_end]
+            n = crop_end
+
         current_arrays = {
             "state": state,
             "action": action,
@@ -659,6 +706,11 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
         segment_ends = np.r_[segment_starts[1:], n]
         segment_lengths = segment_ends - segment_starts
         valid_segments = segment_lengths >= args.min_episode_len
+        if terminal_crop is not None:
+            # 固定的松爪后尾帧可能恰好单独形成长度1的segment。末端语义优先于
+            # 常规短段清理：保留包含真实松爪以及其后的所有尾段，确保最终数据中
+            # 每条轨迹确实有请求数量的松爪后帧。
+            valid_segments |= segment_ends > release_index
         dropped_short_segment_frames = int(segment_lengths[~valid_segments].sum())
         segment_starts = segment_starts[valid_segments]
         segment_ends = segment_ends[valid_segments]
@@ -751,6 +803,7 @@ def convert_episode(episode_dir: Path, args) -> tuple[dict[str, np.ndarray], dic
                 "close_event_frames": int(gripper_close_event.sum()),
                 "conflicting_pico_messages": int(pico_conflicts),
             },
+            "terminal_crop": terminal_crop,
             "sync": {
                 "depth_camera_header": stats(depth_header_errors),
                 "depth_bag_write_time": stats(depth_bag_errors),
@@ -857,6 +910,14 @@ def write_zarr(episodes: list[dict[str, np.ndarray]], reports: list[dict[str, An
                 "control_accepted_only": bool(args.control_accepted_only),
                 "max_retained_frame_gap_ms": args.max_retained_frame_gap_ms,
             },
+            "terminal_crop": {
+                "truncate_after_gripper_open_frames": (
+                    args.truncate_after_gripper_open_frames
+                ),
+                "release_definition": (
+                    "last gripper_command_state close-to-open (0->1) transition"
+                ),
+            },
         }
     )
 
@@ -909,6 +970,30 @@ def validate_zarr(path: Path, expected_episodes: int) -> dict[str, Any]:
         int(np.count_nonzero(np.diff(command_state[start:end, 0])))
         for start, end in zip(starts, ends)
     ]
+    terminal_crop = root.attrs.get("terminal_crop", {})
+    requested_post_open_frames = terminal_crop.get(
+        "truncate_after_gripper_open_frames"
+    )
+    post_open_frames_per_episode = []
+    if requested_post_open_frames is not None:
+        for start, end in zip(starts, ends):
+            open_transitions = (
+                np.flatnonzero(
+                    np.diff(command_state[start:end, 0].astype(np.int8)) == 1
+                )
+                + 1
+            )
+            if not len(open_transitions):
+                raise RuntimeError(
+                    f"episode [{start}, {end})缺少gripper_command_state 0->1松爪转换"
+                )
+            post_frames = int(end - start - int(open_transitions[-1]) - 1)
+            post_open_frames_per_episode.append(post_frames)
+            if post_frames != int(requested_post_open_frames):
+                raise RuntimeError(
+                    f"episode [{start}, {end})松爪后帧数={post_frames}，"
+                    f"期望={requested_post_open_frames}"
+                )
     return {
         "episodes": len(ends),
         "transitions": n,
@@ -922,6 +1007,7 @@ def validate_zarr(path: Path, expected_episodes: int) -> dict[str, Any]:
         "gripper_open_event_frames": int(open_event.sum()),
         "gripper_close_event_frames": int(close_event.sum()),
         "gripper_state_transitions_per_episode": transitions_per_episode,
+        "post_open_frames_per_episode": post_open_frames_per_episode,
     }
 
 
@@ -984,6 +1070,15 @@ def parse_args():
         default=0.061,
         help="仅用于每条轨迹首帧的命令状态初始化；后续标签完全由 Pico 命令锁存",
     )
+    parser.add_argument(
+        "--truncate-after-gripper-open-frames",
+        type=int,
+        default=None,
+        help=(
+            "在最后一次gripper_command_state 0->1真实松爪后仅保留N个已筛选控制帧，"
+            "删除后续撤离/回零准备动作；默认不截断"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -991,6 +1086,11 @@ def main() -> None:
     args = parse_args()
     if args.image_size <= 0 or args.num_points <= 0:
         raise ValueError("--image-size and --num-points must be positive")
+    if (
+        args.truncate_after_gripper_open_frames is not None
+        and args.truncate_after_gripper_open_frames < 0
+    ):
+        raise ValueError("--truncate-after-gripper-open-frames must be non-negative")
     accepted, skipped = discover_episodes(args.input, args.limit)
     print(f"[discover] accepted={len(accepted)} skipped={len(skipped)}", flush=True)
     for item in skipped:
@@ -1035,6 +1135,9 @@ def main() -> None:
             "gripper_open_threshold_m": args.gripper_open_threshold_m,
             "control_accepted_only": args.control_accepted_only,
             "max_retained_frame_gap_ms": args.max_retained_frame_gap_ms,
+            "truncate_after_gripper_open_frames": (
+                args.truncate_after_gripper_open_frames
+            ),
         },
         "episodes": episode_reports,
         "validation": validation,
