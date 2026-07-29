@@ -9,6 +9,8 @@
 * 从训练输出目录的 Hydra 配置自动读取 ``n_obs_steps``、``horizon``
   和 ``n_action_steps``，兼容不同长度的 action chunk。默认使用
   receding-horizon：每个控制周期重新推理，只执行当前 chunk 的第一步。
+* 可选 temporal ensemble 会融合多个历史 chunk 对当前时刻的关节预测；
+  夹爪命令仍使用最新预测，避免开合边沿被连续平均。
 
 默认是 shadow 模式，只读机械臂/相机和打印动作；只有传入 ``--execute`` 并
 输入确认短语才会使能 Piper。第一次上真机建议先运行 ``--offline-smoke``，
@@ -450,14 +452,39 @@ def extract_action_chunk(
     return chunk
 
 
+def temporal_ensemble_action(
+    chunk_history: deque[tuple[int, np.ndarray]],
+    current_step: int,
+    decay: float,
+) -> tuple[np.ndarray, list[int], list[float]]:
+    """融合历史 chunk 中对 ``current_step`` 的重叠预测。
+
+    ``decay`` 越大越偏向最近一次推理。只融合六个关节维度；第七维
+    夹爪采用最新 chunk 的时间对齐预测，防止二值开合命令被平均。
+    """
+
+    candidates: list[np.ndarray] = []
+    ages: list[int] = []
+    for origin_step, chunk in chunk_history:
+        chunk_offset = current_step - origin_step
+        if 0 <= chunk_offset < len(chunk):
+            candidates.append(chunk[chunk_offset])
+            ages.append(chunk_offset)
+    if not candidates:
+        raise RuntimeError("temporal ensemble 没有当前时刻的有效动作候选")
+
+    weights = np.exp(-float(decay) * np.asarray(ages, dtype=np.float64))
+    weights /= weights.sum()
+    stacked = np.stack(candidates).astype(np.float32)
+    result = stacked[-1].copy()
+    result[:6] = np.sum(stacked[:, :6] * weights[:, None], axis=0)
+    if not np.all(np.isfinite(result)):
+        raise RuntimeError("temporal ensemble 结果包含 NaN/Inf")
+    return result, ages, weights.astype(np.float32).tolist()
+
+
 def training_stats(dataset) -> dict[str, np.ndarray]:
     replay = dataset.replay_buffer
-    action_key = getattr(dataset, "action_key", "action")
-    if action_key not in replay:
-        raise RuntimeError(
-            f"数据集训练动作键 {action_key!r} 不在 replay buffer 中，"
-            f"可用键={list(replay.keys())}"
-        )
     state = np.asarray(replay["state"][:], dtype=np.float32)
     # Piper数据配置使用policy_action；不要硬编码成旧数据集的action键。
     action_key = str(getattr(dataset, "action_key", "action"))
@@ -711,6 +738,17 @@ def parse_args():
         ),
     )
     p.add_argument("--diffusion-noise-seed", type=int, default=42)
+    p.add_argument(
+        "--temporal-ensemble",
+        action="store_true",
+        help="融合历史action chunk对当前时刻的重叠关节预测；夹爪仍采用最新预测。",
+    )
+    p.add_argument(
+        "--temporal-ensemble-decay",
+        type=float,
+        default=0.5,
+        help="temporal ensemble指数衰减系数；越大越偏向最新预测，0表示等权。",
+    )
     p.add_argument("--max-point-outlier-fraction", type=float, default=0.25)
     p.add_argument(
         "--skip-point-cloud-distribution-check",
@@ -746,6 +784,8 @@ def main():
         raise ValueError("--speed-percent 必须在 [1,100]")
     if not 0.0 < args.gripper_command_threshold < 1.0:
         raise ValueError("--gripper-command-threshold 必须在 (0,1)")
+    if args.temporal_ensemble_decay < 0:
+        raise ValueError("--temporal-ensemble-decay 不能为负数")
     if args.rate > 15:
         print(
             "[时序警告] 当前 rate 高于采集相机的 15Hz；训练 transition 实际约 13Hz，"
@@ -864,6 +904,12 @@ def main():
         ),
         flush=True,
     )
+    if args.temporal_ensemble:
+        print(
+            f"[动作] temporal ensemble=ON，最多融合{n_action_steps}个重叠预测，"
+            f"decay={args.temporal_ensemble_decay:g}；夹爪使用最新预测",
+            flush=True,
+        )
     print("[人工] 输入 stop/Enter 停止并保持；输入 estop 发送 SDK 硬急停。", flush=True)
     if args.skip_current_joint_range_check:
         print("[安全警告] 已跳过当前关节训练范围检查，仅用于零点/人工初始姿态测试", flush=True)
@@ -959,6 +1005,8 @@ def main():
         next_deadline = time.monotonic()
         active_chunk: np.ndarray = initial_chunk
         active_chunk_origin_step = 0
+        chunk_history: deque[tuple[int, np.ndarray]] = deque(maxlen=n_action_steps)
+        chunk_history.append((active_chunk_origin_step, active_chunk.copy()))
         inference_index = 0
         last_policy_result_id = -1
         for step in range(args.max_steps):
@@ -1013,6 +1061,9 @@ def main():
                     infer_elapsed,
                     _,
                 ) = latest_policy
+                chunk_history.append(
+                    (active_chunk_origin_step, active_chunk.copy())
+                )
                 inference_index += 1
                 ran_inference = True
             # 记录异步结果年龄用于诊断。模型 chunk 的离散时间来自约13Hz
@@ -1020,7 +1071,19 @@ def main():
             # 权重原本的动作语义。
             policy_age_steps = max(0, step - active_chunk_origin_step)
             chunk_step = replan_step
-            predicted_action = active_chunk[chunk_step]
+            latest_action = active_chunk[chunk_step]
+            ensemble_ages: list[int] = [0]
+            ensemble_weights: list[float] = [1.0]
+            if args.temporal_ensemble:
+                predicted_action, ensemble_ages, ensemble_weights = (
+                    temporal_ensemble_action(
+                        chunk_history,
+                        current_step=step,
+                        decay=args.temporal_ensemble_decay,
+                    )
+                )
+            else:
+                predicted_action = latest_action
             target, warnings = safe_action(predicted_action, state, stats, args)
             if robot_enabled:
                 send_action(piper, target, args.speed_percent)
@@ -1029,6 +1092,10 @@ def main():
                 "host_time": time.time(),
                 "joint_gripper_state": state.tolist(),
                 "predicted_chunk": active_chunk.tolist(),
+                "latest_time_aligned_action": latest_action.tolist(),
+                "temporal_ensemble_action": predicted_action.tolist(),
+                "temporal_ensemble_candidate_ages": ensemble_ages,
+                "temporal_ensemble_weights": ensemble_weights,
                 "chunk_step": chunk_step,
                 "policy_chunk_origin_step": active_chunk_origin_step,
                 "policy_age_steps": policy_age_steps,
@@ -1049,6 +1116,7 @@ def main():
             print(
                 f"[step {step:04d}] state={np.round(state,4)} "
                 f"chunk{chunk_step}={np.round(predicted_action,4)} "
+                f"te={len(ensemble_weights)} "
                 f"target={np.round(target,4)} pc_out={fraction:.1%} "
                 f"{'INFER' if ran_inference else 'CACHED'} "
                 f"{'EXEC' if robot_enabled else 'SHADOW'} "
@@ -1094,7 +1162,7 @@ def main():
         if not log_path.is_absolute():
             log_path = REPO_ROOT / log_path
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "camera_fps": args.camera_fps, "speed_percent": args.speed_percent, "max_joint_speed_rad_s": args.max_joint_speed_rad_s, "max_gripper_speed_m_s": args.max_gripper_speed_m_s, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "reuse_diffusion_noise": args.reuse_diffusion_noise, "diffusion_noise_seed": args.diffusion_noise_seed, "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
+        log_path.write_text(json.dumps({"meta": {"output_dir": str(args.output_dir), "policy_subdir": args.policy_subdir, "use_cm": use_cm, "rate_hz": args.rate, "camera_fps": args.camera_fps, "speed_percent": args.speed_percent, "max_joint_speed_rad_s": args.max_joint_speed_rad_s, "max_gripper_speed_m_s": args.max_gripper_speed_m_s, "n_obs_steps": n_obs_steps, "horizon": horizon, "n_action_steps": n_action_steps, "chunk_exec_steps": args.chunk_exec_steps, "policy_replan_rate_hz": args.rate / args.chunk_exec_steps, "reuse_diffusion_noise": args.reuse_diffusion_noise, "diffusion_noise_seed": args.diffusion_noise_seed, "temporal_ensemble": args.temporal_ensemble, "temporal_ensemble_decay": args.temporal_ensemble_decay, "temporal_ensemble_gripper": "latest_prediction", "point_cloud_frame": "d435i_depth_optical_frame", "depth_aligned_to_color": False, "skip_current_joint_range_check": args.skip_current_joint_range_check, "skip_gripper_safety_check": args.skip_gripper_safety_check, "skip_point_cloud_distribution_check": args.skip_point_cloud_distribution_check, "stop_reason": stop_reason}, "records": records}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[日志] 已保存: {log_path.resolve()}", flush=True)
 
 
