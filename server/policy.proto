@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package rl100.remote.v1;
+
+service PolicyService {
+  rpc GetServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+  rpc Infer(InferenceRequest) returns (InferenceResponse);
+  rpc ResetEpisode(ResetEpisodeRequest) returns (ResetEpisodeResponse);
+}
+
+message ServerInfoRequest {
+  string protocol_version = 1;
+}
+
+message ServerInfoResponse {
+  string protocol_version = 1;
+  string model_version = 2;
+  string output_dir = 3;
+  string policy_subdir = 4;
+  uint32 n_obs_steps = 5;
+  uint32 n_action_steps = 6;
+  repeated uint32 image_shape = 7;
+  repeated uint32 point_cloud_shape = 8;
+  repeated uint32 agent_pos_shape = 9;
+  repeated uint32 action_shape = 10;
+  repeated float state_min = 11;
+  repeated float state_max = 12;
+  repeated float action_min = 13;
+  repeated float action_max = 14;
+  repeated float point_cloud_low = 15;
+  repeated float point_cloud_high = 16;
+  string gripper_action_mode = 17;
+  string action_key = 18;
+}
+
+message InferenceRequest {
+  string protocol_version = 1;
+  string episode_id = 2;
+  uint64 sequence_id = 3;
+  uint64 capture_timestamp_ns = 4;
+  bytes agent_pos_f32 = 5;
+  bytes image_f32 = 6;
+  bytes point_cloud_f32 = 7;
+}
+
+message InferenceResponse {
+  string protocol_version = 1;
+  string episode_id = 2;
+  uint64 sequence_id = 3;
+  uint64 capture_timestamp_ns = 4;
+  bytes action_chunk_f32 = 5;
+  uint32 action_steps = 6;
+  uint32 action_dims = 7;
+  double inference_time_ms = 8;
+  string model_version = 9;
+  bool ready = 10;
+  string status_message = 11;
+}
+
+message ResetEpisodeRequest {
+  string protocol_version = 1;
+  string episode_id = 2;
+}
+
+message ResetEpisodeResponse {
+  string protocol_version = 1;
+  string episode_id = 2;
+  bool reset = 3;
+}
