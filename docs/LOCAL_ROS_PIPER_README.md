@@ -3,6 +3,21 @@
 本机端连接真实设备，负责采集观测、接收服务器动作、执行最终安全检查并下发
 Piper。模型和 checkpoint 在服务器 GPU 容器中运行；本机不需要加载 DP3 模型。
 
+当前目标架构：
+
+```text
+RealSense ROS driver ─┐
+                      ├─> 观测/推理 ROS 节点 ──gRPC──> 服务器 DP3
+Piper ROS driver ─────┘                                      │
+                                                             ↓
+                                               安全规划 ROS 节点
+                                                             ↓
+                                                    Piper ROS driver
+```
+
+Piper ROS driver 是唯一的 CAN 所有者。观测节点和规划节点不连接 `piper_sdk`；
+服务器只运行 gRPC 推理服务，不运行 ROS。
+
 ## 1. 本机职责
 
 ```text
@@ -36,7 +51,7 @@ RealSense RGB-D + Piper feedback
 /home/mtuser/文档/zyf/piper_teleop_v1.1
 ```
 
-Piper SDK 位于：
+Piper SDK 位于（由 Piper ROS driver 内部调用）：
 
 ```text
 /home/mtuser/文档/zyf/01-Piper/piper_sdk
@@ -64,6 +79,33 @@ ABI/导入错误。服务器 DP3 推理环境与本机 ROS 环境必须分开。
 
 `project_env.sh` 会设置 ROS 的 `PYTHONPATH`。在 source 之后如需执行 Conda 管理命令，
 应新开终端或先执行 `unset PYTHONPATH`；正常运行 ROS/Piper 节点时不要清除它。
+
+当前本机状态：Piper SDK 和 Piper ROS 源码已存在，RealSense ROS 包已安装；Piper
+控制包需要构建后再使用。
+
+构建 Piper ROS 消息和控制包（不启动 CAN）：
+
+```bash
+source /home/mtuser/miniconda3/etc/profile.d/conda.sh
+conda activate rl100_local
+source /home/mtuser/文档/zyf/piper_teleop_v1.1/tools/project_env.sh
+cd /home/mtuser/文档/zyf/piper_teleop_v1.1/third_party/piper_ros
+colcon --log-base /tmp/piper_ros_log build \
+  --symlink-install --packages-select piper_msgs piper \
+  --build-base /tmp/piper_ros_build \
+  --install-base /home/mtuser/文档/zyf/piper_teleop_v1.1/third_party/piper_ros/install \
+  --cmake-args -DBUILD_TESTING=OFF
+source install/setup.bash
+ros2 pkg prefix piper
+ros2 pkg prefix piper_msgs
+ros2 pkg prefix realsense2_camera
+```
+
+若 `piper_msgs` 提示缺少接口生成器，只安装最小依赖：
+
+```bash
+sudo apt-get install ros-humble-rosidl-default-generators
+```
 
 ## 3. 软件环境检查
 
@@ -138,6 +180,8 @@ ros2 launch realsense2_camera rs_launch.py \
 ```text
 tools/local/piper_policy_bridge.py
 tools/local/piper_remote_runtime.py
+tools/local/ros_observation_inference_node.py
+tools/local/ros_action_planner_node.py
 tools/local/ros_piper_bridge_node.py
 tools/local/remote_server_smoke.py
 tools/local/requirements.txt
@@ -154,18 +198,17 @@ server/policy_pb2_grpc.py
 4. 添加 `episode_id`、`sequence_id` 和时间戳后发送给服务器。
 5. 接收 `action_chunk[4,7]`，只接受对应序号且未过期的响应。
 6. 对动作执行本地 `safe_action`、速度/加速度限制和夹爪限制。
-7. 作为 ROS 2 节点运行，并由该节点通过 Piper SDK/CAN 下发动作。
-8. 相机、Piper 反馈或网络超时时保持当前目标并停止接受新动作。
+7. 由独立 planner 节点执行最终动作限幅和 100Hz 轨迹规划。
+8. Piper ROS driver 负责唯一的 CAN 下发；相机、反馈或网络超时时进入保持。
 
-当前 bridge 是 ROS 2 节点，同时直接复用 Piper SDK，不加载本地 DP3 模型。gRPC
-请求运行在独立线程，100 Hz 本地控制、速度/加速度规划、watchdog 和最终下发不被
-网络调用阻塞。
+`ros_observation_inference_node.py` 和 `ros_action_planner_node.py` 是新的目标架构。
+原来的 `piper_policy_bridge.py` 保留作直连 SDK 的兼容/调试原型；正式真机运行时不要
+与 Piper ROS driver 同时启动它。
 
-重要：运行本 bridge 时，不要再启动 `piper_ctrl_single_node`、
-`start_single_piper.launch.py` 或其他会连接同一个 `can0` 的 Piper SDK 进程。bridge
-本身是唯一的 CAN 所有者；两个进程同时连接机械臂会产生竞争和不可预测的控制命令。
+重要：正式架构只允许 Piper ROS driver 连接 `can0`。不要同时启动旧直连 bridge、
+`piper_ctrl_single_node` 的第二个实例或其他 Piper SDK 进程。
 
-bridge 提供以下 ROS 2 接口：
+旧版直连 bridge 提供以下 telemetry 接口（仅调试用）：
 
 ```text
 发布 /remote_dp3/joint_states_feedback  sensor_msgs/msg/JointState
@@ -177,6 +220,21 @@ bridge 提供以下 ROS 2 接口：
 ```
 
 `JointState.position` 前六维为弧度，第七维 `gripper_width` 为米。
+
+新架构 topic：
+
+```text
+订阅 /joint_states_feedback             Piper driver feedback
+订阅 /camera/color/image_raw            RealSense RGB
+订阅 /camera/depth/image_rect_raw       RealSense 未对齐 depth
+订阅 /camera/depth/camera_info          depth 内参
+发布 /remote_dp3/action_chunk           std_msgs/msg/String（JSON）
+订阅 /remote_dp3/action_chunk           planner 输入
+发布 /remote_dp3/joint_cmd              Piper driver command remap
+```
+
+`action_chunk` JSON 包含 `episode_id`、`sequence_id`、`action_chunk[4,7]`、模型版本
+和训练统计；后续稳定后可将它替换为正式的 ROS interface package。
 
 协议接口：
 
@@ -224,7 +282,50 @@ Infer -> action_chunk` 的完整通信。合成观测只验证协议和服务链
 
 ## 6. Shadow 到真机的启动顺序
 
-### Shadow 阶段
+正式架构的启动顺序是：
+
+```text
+1. RealSense ROS driver
+2. Piper ROS driver（auto_enable=false，唯一 CAN 所有者）
+3. ros_observation_inference_node.py
+4. ros_action_planner_node.py
+```
+
+在没有真机时，只运行纯网络 smoke，不启动下面三个硬件相关节点：
+
+```bash
+source /home/mtuser/miniconda3/etc/profile.d/conda.sh
+conda activate rl100_local
+cd /home/mtuser/文档/zyf/RL-100
+python tools/local/remote_server_smoke.py --server 127.0.0.1:50051
+```
+
+确认 CAN 和工作区安全后，Piper driver 命令如下（会连接 CAN）：
+
+```bash
+source /home/mtuser/文档/zyf/piper_teleop_v1.1/tools/project_env.sh
+source /home/mtuser/文档/zyf/piper_teleop_v1.1/third_party/piper_ros/install/setup.bash
+ros2 run piper piper_single_ctrl --ros-args \
+  -p can_port:=can0 -p auto_enable:=false \
+  -r joint_ctrl_single:=/remote_dp3/joint_cmd
+```
+
+观测/推理节点和规划节点分别运行：
+
+```bash
+cd /home/mtuser/文档/zyf/RL-100
+python tools/local/ros_observation_inference_node.py \
+  --ros-args -p server:=127.0.0.1:50051
+```
+
+```bash
+cd /home/mtuser/文档/zyf/RL-100
+python tools/local/ros_action_planner_node.py
+```
+
+规划节点默认发布 `/remote_dp3/joint_cmd`，与上面的 Piper driver remap 对接。
+
+### 旧版直连 SDK Shadow（兼容调试，不用于正式架构）
 
 ```bash
 source /home/mtuser/miniconda3/etc/profile.d/conda.sh
@@ -241,7 +342,7 @@ python tools/local/piper_policy_bridge.py \
 ```
 
 默认就是 shadow：读取真机反馈和相机、请求服务器并打印/记录动作，但绝不使能或
-下发 Piper。
+下发 Piper。正式架构应使用前面列出的 Piper ROS driver、观测节点和 planner 节点。
 
 在另一个已经 source ROS 环境的终端可观察节点：
 

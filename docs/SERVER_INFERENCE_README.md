@@ -1,22 +1,26 @@
 # 服务器端 DP3 推理环境
 
 本文说明如何在服务器的 VS Code 容器中加载并验证 control-clean DP3 模型。
-服务器只做 GPU 推理，不连接本地 Piper、CAN、RealSense 或 ROS。RealSense、Piper
-反馈读取、动作安全检查和最终下发应运行在本地真机电脑。
+服务器是纯 gRPC 推理服务，不启动 ROS，不连接本地 Piper、CAN 或 RealSense。RealSense、
+Piper 反馈读取、动作安全检查和最终下发运行在本地 ROS 2 控制端。
 
 ## 1. 部署边界
 
 ```text
 本地真机电脑                         服务器 GPU 容器
-RealSense + ROS/Piper                RL-100 + PyTorch + checkpoint
-读取 joint/gripper 状态       --->   组装观测、模型推理
-安全限幅、watchdog、急停       <---   返回 action chunk
-JointCtrl/ROS 下发
+RealSense ROS + Piper ROS driver     RL-100 + PyTorch + checkpoint
+观测/推理 ROS 节点            --->   组装观测、模型推理
+安全规划 ROS 节点             <---   返回 action chunk
+Piper driver/CAN 下发
 ```
 
 服务器容器不需要映射 `/dev/can0`、Piper USB 或 RealSense USB，也不需要使用
 `--privileged`。第一阶段可以只在服务器运行离线 smoke test；远程真机运行时，
 应将模型加载/`predict_policy` 抽成常驻推理服务，再由本地控制节点发送观测并接收动作。
+
+服务器不需要安装或启动 ROS 2。ROS topic 只存在于本地；跨机器链路使用 gRPC，推荐
+SSH 隧道或容器端口映射暴露 `50051`。服务器只能返回策略动作，不能发送 CAN 命令；
+最终限幅、watchdog 和急停必须由本地 planner 执行。
 
 ## 2. 服务器目录和权重
 
@@ -144,6 +148,16 @@ server/
 ├── inference_server.py        # gRPC 服务入口
 └── smoke_client.py            # 不连接真机的服务自测客户端
 ```
+
+本地对应的策略节点位于仓库：
+
+```text
+tools/local/ros_observation_inference_node.py  # ROS observation -> gRPC
+tools/local/ros_action_planner_node.py         # action -> 本地安全规划
+```
+
+服务器返回的动作 chunk 固定为 `[4,7]`，并携带 `episode_id`、`sequence_id`、模型
+版本和训练统计；服务器不执行本地关节限幅，也不依赖 ROS 消息类型。
 
 ### 6.1 `server/policy.proto`
 
