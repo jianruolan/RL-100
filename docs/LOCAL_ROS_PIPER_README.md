@@ -139,6 +139,7 @@ ros2 launch realsense2_camera rs_launch.py \
 tools/local/piper_policy_bridge.py
 tools/local/piper_remote_runtime.py
 tools/local/ros_piper_bridge_node.py
+tools/local/remote_server_smoke.py
 tools/local/requirements.txt
 server/policy.proto
 server/policy_pb2.py
@@ -208,6 +209,18 @@ python tools/local/piper_policy_bridge.py \
 
 服务器必须通过 `GetServerInfo` 返回训练安全统计；本地会检查 `policy_action`、
 `n_obs_steps=3`、`n_action_steps=4` 和所有输入输出形状。缺少或不匹配时拒绝启动。
+
+如果还没有连接真机，使用下面的纯网络测试发送一次合成观测。它不会导入 ROS、
+RealSense 或 Piper SDK，也不会访问 `can0`：
+
+```bash
+python tools/local/remote_server_smoke.py \
+  --server 127.0.0.1:50051
+```
+
+看到 `[network-smoke] PASS`，才说明本机确实完成了 `GetServerInfo -> ResetEpisode ->
+Infer -> action_chunk` 的完整通信。合成观测只验证协议和服务链路，不代表真实相机
+分布或真机动作已经验证。
 
 ## 6. Shadow 到真机的启动顺序
 
