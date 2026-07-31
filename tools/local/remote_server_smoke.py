@@ -57,25 +57,41 @@ def main() -> int:
         agent_pos = np.zeros(runtime.AGENT_POS_SHAPE, dtype=np.float32)
         image = np.zeros(runtime.IMAGE_SHAPE, dtype=np.float32)
         point_cloud = np.zeros(runtime.POINT_CLOUD_SHAPE, dtype=np.float32)
-        request = runtime.make_request(
-            episode_id,
-            sequence_id=1,
-            capture_timestamp_ns=time.time_ns(),
-            agent_pos=agent_pos,
-            image=image,
-            point_cloud=point_cloud,
-        )
-        response = client.infer(request, args.rpc_timeout)
-        if response.protocol_version != runtime.PROTOCOL_VERSION:
-            raise RuntimeError(
-                f"响应协议不一致: server={response.protocol_version!r}, "
-                f"local={runtime.PROTOCOL_VERSION!r}"
+        response = None
+        for sequence_id in range(1, contract.n_obs_steps + 1):
+            request = runtime.make_request(
+                episode_id,
+                sequence_id=sequence_id,
+                capture_timestamp_ns=time.time_ns(),
+                agent_pos=agent_pos,
+                image=image,
+                point_cloud=point_cloud,
             )
-        if response.episode_id != episode_id or response.sequence_id != 1:
-            raise RuntimeError(
-                "响应 episode_id/sequence_id 不匹配: "
-                f"episode={response.episode_id!r}, seq={response.sequence_id}"
-            )
+            response = client.infer(request, args.rpc_timeout)
+            if response.protocol_version != runtime.PROTOCOL_VERSION:
+                raise RuntimeError(
+                    f"响应协议不一致: server={response.protocol_version!r}, "
+                    f"local={runtime.PROTOCOL_VERSION!r}"
+                )
+            if (
+                response.episode_id != episode_id
+                or response.sequence_id != sequence_id
+            ):
+                raise RuntimeError(
+                    "响应 episode_id/sequence_id 不匹配: "
+                    f"episode={response.episode_id!r}, "
+                    f"seq={response.sequence_id}, expected={sequence_id}"
+                )
+            if not response.ready and sequence_id < contract.n_obs_steps:
+                print(
+                    f"[network-smoke] 预热观测历史 {sequence_id}/"
+                    f"{contract.n_obs_steps}: {response.status_message}",
+                    flush=True,
+                )
+                continue
+
+        if response is None:
+            raise RuntimeError("未收到服务器响应")
         if not response.ready:
             raise RuntimeError(f"服务器未就绪: {response.status_message}")
         action = runtime.decode_f32(

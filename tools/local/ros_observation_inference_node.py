@@ -39,6 +39,7 @@ class ObservationInferenceNode(Node):
         self.declare_parameter("action_topic", "/remote_dp3/action_chunk")
         self.declare_parameter("status_topic", "/remote_dp3/inference_status")
         self.declare_parameter("fps", 15.0)
+        self.declare_parameter("rpc_timeout", 1.0)
         self.declare_parameter("max_sensor_gap_ms", 150.0)
         self.declare_parameter("expected_output_name", runtime_name())
         self.declare_parameter("expected_policy_subdir", "bc")
@@ -65,7 +66,9 @@ class ObservationInferenceNode(Node):
         )
         self.client.reset_episode(self.episode_id, 5.0)
         self.worker = runtime.AsyncPolicyClient(
-            self.client, 0.2, self.contract.n_action_steps
+            self.client,
+            float(self.get_parameter("rpc_timeout").value),
+            self.contract.n_action_steps,
         )
         self.worker.start()
 
@@ -94,7 +97,8 @@ class ObservationInferenceNode(Node):
         self.timer = self.create_timer(period, self.tick)
         self.get_logger().info(
             f"remote inference ready: server={self.get_parameter('server').value}, "
-            f"episode={self.episode_id}"
+            f"episode={self.episode_id}, "
+            f"rpc_timeout={self.get_parameter('rpc_timeout').value}s"
         )
 
     def on_joint(self, message: JointState) -> None:
@@ -139,6 +143,7 @@ class ObservationInferenceNode(Node):
                     "episode_id": self.episode_id,
                     "sequence_id": result.sequence_id,
                     "capture_timestamp_ns": result.capture_timestamp_ns,
+                    "submitted_monotonic_ns": int(result.submitted_monotonic * 1e9),
                     "received_monotonic_ns": time.monotonic_ns(),
                     "model_version": self.contract.model_version,
                     "action_chunk": result.action_chunk.tolist(),
@@ -146,7 +151,10 @@ class ObservationInferenceNode(Node):
                     "action_max": self.contract.stats.action_max.tolist(),
                     "state_min": self.contract.stats.state_min.tolist(),
                     "state_max": self.contract.stats.state_max.tolist(),
+                    "point_cloud_low": self.contract.stats.point_cloud_low.tolist(),
+                    "point_cloud_high": self.contract.stats.point_cloud_high.tolist(),
                     "gripper_action_mode": self.contract.stats.gripper_action_mode,
+                    "action_key": self.contract.stats.action_key,
                 }, ensure_ascii=False, separators=(",", ":"))))
 
         max_gap = float(self.get_parameter("max_sensor_gap_ms").value) / 1000.0

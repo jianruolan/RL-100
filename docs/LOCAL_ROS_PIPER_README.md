@@ -233,8 +233,10 @@ server/policy_pb2_grpc.py
 发布 /remote_dp3/joint_cmd              Piper driver command remap
 ```
 
-`action_chunk` JSON 包含 `episode_id`、`sequence_id`、`action_chunk[4,7]`、模型版本
-和训练统计；后续稳定后可将它替换为正式的 ROS interface package。
+`action_chunk` JSON 包含 `episode_id`、`sequence_id`、`action_chunk[4,7]`、模型版本、
+本地 monotonic 提交时间和完整训练安全统计；这些统计由 planner 用于执行
+与 `infer_piper_control_clean_dp3.py` 一致的 `safe_action`。后续稳定后可将
+它替换为正式的 ROS interface package。
 
 协议接口：
 
@@ -315,7 +317,10 @@ ros2 run piper piper_single_ctrl --ros-args \
 ```bash
 cd /home/mtuser/文档/zyf/RL-100
 python tools/local/ros_observation_inference_node.py \
-  --ros-args -p server:=127.0.0.1:50051
+  --ros-args \
+  -p server:=127.0.0.1:50051 \
+  -p rpc_timeout:=1.0 \
+  -p fps:=5.0
 ```
 
 ```bash
@@ -324,6 +329,46 @@ python tools/local/ros_action_planner_node.py
 ```
 
 规划节点默认发布 `/remote_dp3/joint_cmd`，与上面的 Piper driver remap 对接。
+本地 planner 的处理顺序固定为：
+
+```text
+action_chunk[0]
+  -> safe_action（物理限位 + 训练分布 margin + 夹爪命令解码）
+  -> JointTrajectoryPlanner（速度/加速度/跟踪误差限制）
+  -> 100 Hz JointState 指令
+```
+
+下列 ROS 参数名和默认值与
+`tools/teleop_off2off_data/infer_piper_control_clean_dp3.py` 保持一致：
+
+```text
+rate=100.0
+max_joint_speed_rad_s=0.20
+max_joint_accel_rad_s2=0.50
+max_gripper_speed_m_s=0.02
+planner_tracking_error_rad=0.10
+dataset_margin_rad=0.03
+gripper_margin_m=0.005
+gripper_command_threshold=0.5
+clip_actions=false
+skip_current_joint_range_check=false
+skip_gripper_safety_check=false
+```
+
+`clip_actions=false` 时，超出训练分布的目标会被拒绝，这与原脚本不传
+`--clip-actions` 时一致。如果明确需要原脚本的 `--clip-actions` 行为，启动
+planner 时显式添加：
+
+```bash
+python tools/local/ros_action_planner_node.py --ros-args \
+  -p clip_actions:=true
+```
+
+除上述原脚本规划逻辑外，ROS 节点保留 `max_action_age_ms`、序号单调性和
+反馈超时检查；这些只是远程通信架构的额外安全层，不会在服务器侧重复规划。
+CPU 推理服务建议先使用 `rpc_timeout=1.0s`；RPC 超时只控制网络等待，planner 仍按
+`max_action_age_ms` 独立拒绝旧动作。当前 CPU 实测推理约 142ms，建议先以 5Hz 请求，
+避免用 15Hz 持续压满 CPU；切换 GPU 后再提高观测请求频率。
 
 ### 旧版直连 SDK Shadow（兼容调试，不用于正式架构）
 

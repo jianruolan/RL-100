@@ -462,23 +462,35 @@ def safe_policy_target(
 
 
 class JointTrajectoryPlanner:
+    """Acceleration-limited joint interpolation below the learned policy.
+
+    Keep this implementation in lockstep with
+    ``tools/teleop_off2off_data/infer_rl100_gap100_piper_last.py``.  The
+    control-clean DP3 executor imports that planner directly.
+    """
+
     def __init__(
         self,
         initial: np.ndarray,
         joint_speed: float,
         joint_accel: float,
         gripper_speed: float,
-        tracking_error: float,
+        tracking_error: float | None,
     ):
         self.position = np.asarray(initial, dtype=np.float64).copy()
         self.velocity = np.zeros(6, dtype=np.float64)
         self.joint_speed = float(joint_speed)
         self.joint_accel = float(joint_accel)
         self.gripper_speed = float(gripper_speed)
-        self.tracking_error = float(tracking_error)
+        self.tracking_error = (
+            None if tracking_error is None else float(tracking_error)
+        )
 
     def hold(self, measured: np.ndarray, dt: float) -> np.ndarray:
-        return self.step(np.asarray(measured), measured, dt)
+        target = self.position.copy()
+        target[:6] = np.asarray(measured, dtype=np.float64)[:6]
+        target[6] = float(measured[6])
+        return self.step(target, measured, dt)
 
     def step(
         self, target: np.ndarray, measured: np.ndarray, dt: float
@@ -486,13 +498,14 @@ class JointTrajectoryPlanner:
         dt = float(np.clip(dt, 1e-4, 0.1))
         target = np.asarray(target, dtype=np.float64)
         measured = np.asarray(measured, dtype=np.float64)
-        tracking_delta = self.position[:6] - measured[:6]
-        bad = np.abs(tracking_delta) > self.tracking_error
-        if np.any(bad):
-            self.position[:6][bad] = measured[:6][bad] + np.clip(
-                tracking_delta[bad], -self.tracking_error, self.tracking_error
-            )
-            self.velocity[bad] = 0.0
+        if self.tracking_error is not None:
+            tracking_delta = self.position[:6] - measured[:6]
+            bad = np.abs(tracking_delta) > self.tracking_error
+            if np.any(bad):
+                self.position[:6][bad] = measured[:6][bad] + np.clip(
+                    tracking_delta[bad], -self.tracking_error, self.tracking_error
+                )
+                self.velocity[bad] = 0.0
         error = target[:6] - self.position[:6]
         braking_speed = np.sqrt(2.0 * self.joint_accel * np.abs(error))
         desired_velocity = np.sign(error) * np.minimum(
